@@ -1,0 +1,237 @@
+// Phase 1: core data model.
+//
+// entitlement_registry is modeled as a pre-existing, external table per the
+// assignment spec — we don't assert ownership of its ID generation or
+// constraints beyond what the spec states, and nothing else holds a formal
+// FK into it (joins happen by value in the lookup service, Phase 3).
+//
+// Everything else is our own design. Notable structural decisions (see
+// technical brief for full rationale):
+// - access_requests uses a dual identity: internal `id` (UUID PK, used for
+//   FKs) vs `requestId` (upstream business key, used for idempotency).
+// - ai_recommendations holds only accepted/final recommendations; failed or
+//   malformed LLM attempts are logged to audit_log, not this table.
+// - ai_recommendation_citations has a real FK to policy_chunks.id (the LLM
+//   must cite chunks by the ID injected into its prompt context, validated
+//   before persistence) plus a denormalized snapshot of document_name/
+//   section/excerpt so historical citations survive later re-ingestion of a
+//   policy document.
+// - human_decisions is append-only by convention (no update path); the most
+//   recent row per access_request is authoritative. Overrides require a
+//   non-empty rationale, enforced by both the app and a DB CHECK constraint.
+// - audit_log is enforced append-only by a DB trigger (see migration).
+//   Identifying PII in its `payload` JSON (employee_id, cost_center) is masked
+//   before write (see common/pii.util.ts); FK columns such as
+//   access_request_id stay unmasked so audit trails remain joinable/queryable.
+// - policy_chunks.embedding is Unsupported("vector(1536)") — Prisma cannot
+//   model pgvector natively; the column and its HNSW index are added via raw
+//   SQL in the migration, and similarity search goes through $queryRaw. Prisma
+//   also can't retain that index across later migrations, so it was recreated
+//   explicitly in 20260723002000_recreate_policy_chunks_embedding_index after
+//   an unrelated migration dropped it.
+// - access_requests.entitlementSnapshot (Phase 3) freezes the entitlement
+//   lookup result at processing time rather than being recomputed later, so
+//   a recommendation stays explainable even if the underlying entitlement
+//   registry changes afterward.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model EntitlementRegistry {
+  registryId     BigInt   @id @map("registry_id")
+  employeeId     String   @map("employee_id") @db.VarChar(50)
+  systemName     String   @map("system_name") @db.VarChar(50)
+  entitlementKey String   @map("entitlement_key") @db.VarChar(100)
+  grantedDate    DateTime @map("granted_date") @db.Timestamp()
+  isActive       Boolean  @map("is_active")
+
+  @@index([employeeId])
+  @@map("entitlement_registry")
+}
+
+enum RequestStatus {
+  PENDING
+  ENTITLEMENTS_LOADED
+  RECOMMENDED
+  DECIDED
+  FAILED
+
+  @@map("request_status")
+}
+
+enum Decision {
+  APPROVE
+  DENY
+  ESCALATE
+
+  @@map("decision")
+}
+
+enum HumanDecisionType {
+  APPROVE
+  DENY
+  OVERRIDE
+
+  @@map("human_decision_type")
+}
+
+model AccessRequest {
+  id                  String        @id @default(uuid()) @db.Uuid
+  requestId           String        @unique @map("request_id")
+  idempotencyKey      String?       @unique @map("idempotency_key")
+  employeeId          String        @map("employee_id")
+  requestType         String        @map("request_type")
+  targetSystem        String        @map("target_system")
+  entitlementKey      String        @map("entitlement_key")
+  justification       String        @map("justification") @db.Text
+  requesterTitle      String        @map("requester_title")
+  requesterDepartment String        @map("requester_department")
+  requesterCostCenter String        @map("requester_cost_center")
+  status              RequestStatus @default(PENDING)
+  entitlementSnapshot Json?         @map("entitlement_snapshot")
+  submittedAt         DateTime      @map("submitted_at")
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  recommendations AiRecommendation[]
+  humanDecisions  HumanDecision[]
+  auditLogs       AuditLog[]
+  idempotencyKeys IdempotencyKey[]
+
+  @@index([employeeId])
+  @@index([status])
+  @@map("access_requests")
+}
+
+model AiRecommendation {
+  id              String   @id @default(uuid()) @db.Uuid
+  accessRequestId String   @map("access_request_id") @db.Uuid
+  decision        Decision
+  justification   String   @db.Text
+  confidence      Float
+  modelName       String   @map("model_name")
+  promptVersion   String   @map("prompt_version")
+  rawResponse     Json     @map("raw_response")
+  attemptNumber   Int      @default(1) @map("attempt_number")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  accessRequest  AccessRequest              @relation(fields: [accessRequestId], references: [id])
+  citations      AiRecommendationCitation[]
+  humanDecisions HumanDecision[]
+
+  @@index([accessRequestId])
+  @@map("ai_recommendations")
+}
+
+model AiRecommendationCitation {
+  id                 String   @id @default(uuid()) @db.Uuid
+  aiRecommendationId String   @map("ai_recommendation_id") @db.Uuid
+  policyChunkId      String   @map("policy_chunk_id") @db.Uuid
+  documentName       String   @map("document_name")
+  section            String?
+  excerpt            String   @db.Text
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  aiRecommendation AiRecommendation @relation(fields: [aiRecommendationId], references: [id])
+  policyChunk      PolicyChunk      @relation(fields: [policyChunkId], references: [id])
+
+  @@index([aiRecommendationId])
+  @@index([policyChunkId])
+  @@map("ai_recommendation_citations")
+}
+
+model HumanDecision {
+  id                 String            @id @default(uuid()) @db.Uuid
+  accessRequestId    String            @map("access_request_id") @db.Uuid
+  aiRecommendationId String?           @map("ai_recommendation_id") @db.Uuid
+  reviewerId         String            @map("reviewer_id")
+  decision           HumanDecisionType
+  rationale          String?           @db.Text
+  createdAt          DateTime          @default(now()) @map("created_at")
+
+  accessRequest    AccessRequest     @relation(fields: [accessRequestId], references: [id])
+  aiRecommendation AiRecommendation? @relation(fields: [aiRecommendationId], references: [id])
+
+  @@index([accessRequestId])
+  @@map("human_decisions")
+}
+
+model AuditLog {
+  id              BigInt   @id @default(autoincrement())
+  accessRequestId String?  @map("access_request_id") @db.Uuid
+  eventType       String   @map("event_type")
+  actor           String
+  payload         Json
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  accessRequest AccessRequest? @relation(fields: [accessRequestId], references: [id])
+
+  @@index([accessRequestId])
+  @@map("audit_log")
+}
+
+model IdempotencyKey {
+  key             String   @id
+  accessRequestId String   @map("access_request_id") @db.Uuid
+  firstSeenAt     DateTime @default(now()) @map("first_seen_at")
+
+  accessRequest AccessRequest @relation(fields: [accessRequestId], references: [id])
+
+  @@map("idempotency_keys")
+}
+
+model PolicyDocument {
+  id            String   @id @default(uuid()) @db.Uuid
+  documentName  String   @map("document_name")
+  version       String
+  effectiveDate DateTime @map("effective_date")
+  sourcePath    String   @map("source_path")
+  ingestedAt    DateTime @default(now()) @map("ingested_at")
+
+  chunks PolicyChunk[]
+
+  @@map("policy_documents")
+}
+
+model PolicyChunk {
+  id              String                       @id @default(uuid()) @db.Uuid
+  documentId      String                       @map("document_id") @db.Uuid
+  chunkIndex      Int                          @map("chunk_index")
+  section         String?
+  policyDomain    String?                      @map("policy_domain")
+  department      String?
+  costCenter      String?                      @map("cost_center")
+  targetSystem    String?                      @map("target_system")
+  entitlementType String?                      @map("entitlement_type")
+  content         String                       @db.Text
+  embedding       Unsupported("vector(1536)")?
+  createdAt       DateTime                     @default(now()) @map("created_at")
+
+  document  PolicyDocument             @relation(fields: [documentId], references: [id])
+  citations AiRecommendationCitation[]
+
+  @@index([documentId])
+  @@map("policy_chunks")
+}
+
+model EvaluationResult {
+  id               String   @id @default(uuid()) @db.Uuid
+  runId            String   @map("run_id")
+  caseId           String   @map("case_id")
+  expectedDecision String?  @map("expected_decision")
+  actualDecision   String?  @map("actual_decision")
+  passed           Boolean
+  latencyMs        Int      @map("latency_ms")
+  estimatedCostUsd Float    @map("estimated_cost_usd")
+  notes            String?  @db.Text
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@index([runId])
+  @@map("evaluation_results")
+}
