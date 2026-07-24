@@ -12,7 +12,7 @@ directed by the author.
 - [`docs/architecture-blueprint.md`](docs/architecture-blueprint.md) — system architecture diagram
 - [`docs/technical-implementation-brief.pdf`](docs/technical-implementation-brief.pdf) — 2-page technical brief
 - [`docs/CHUNKING_STRATEGY.md`](docs/CHUNKING_STRATEGY.md) — RAG chunking rationale
-- [`CLAUDE.md`](CLAUDE.md) — architectural principles/constraints this project follows
+
 
 ## Repo layout
 
