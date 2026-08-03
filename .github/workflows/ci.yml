@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
   build-and-test:
@@ -26,7 +26,10 @@ jobs:
       - name: Generate Prisma client
         run: npm run prisma:generate --workspace backend
 
-      - name: Type-check & build
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Build
         run: npm run build
 
       - name: Test backend

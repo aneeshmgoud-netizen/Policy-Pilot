@@ -11,6 +11,7 @@
     "dev:frontend": "npm run dev --workspace frontend",
     "build": "npm run build --workspace backend && npm run build --workspace frontend",
     "lint": "npm run lint --workspace backend && npm run lint --workspace frontend",
+    "type-check": "npm run type-check --workspace backend && npm run type-check --workspace frontend",
     "test": "npm run test --workspace backend",
     "docker:up": "docker compose -f docker/docker-compose.yml up -d",
     "docker:down": "docker compose -f docker/docker-compose.yml down",
