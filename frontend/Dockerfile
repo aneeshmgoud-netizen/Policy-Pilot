@@ -5,7 +5,9 @@
 # builds standalone.
 
 # ---- builder ----------------------------------------------------------
-FROM node:20-alpine AS builder
+# Kept in lockstep with the Node version pinned in CI (.github/workflows/ci.yml)
+# and used locally.
+FROM node:24-alpine AS builder
 WORKDIR /app
 
 COPY package.json ./

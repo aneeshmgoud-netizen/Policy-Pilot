@@ -3,7 +3,7 @@
 // actual enforcement point (DashboardAuthGuard rejects anything not in its
 // own roster); this list only drives the identity-switcher UI so a reviewer
 // can pick who they're "logged in as" without a real auth server.
-export type DashboardRole = 'REVIEWER' | 'VIEWER';
+export type DashboardRole = 'REVIEWER' | 'VIEWER' | 'GOVERNANCE_APPROVER';
 
 export interface MockUser {
   token: string;
@@ -30,5 +30,11 @@ export const MOCK_USERS: MockUser[] = [
     id: 'viewer:dana',
     displayName: 'Dana Ortiz (view-only)',
     role: 'VIEWER',
+  },
+  {
+    token: 'mock-token-governance',
+    id: 'governance:priya',
+    displayName: 'Priya Anand (governance)',
+    role: 'GOVERNANCE_APPROVER',
   },
 ];

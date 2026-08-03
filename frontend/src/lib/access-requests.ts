@@ -8,8 +8,10 @@ export function fetchAccessRequests(): Promise<AccessRequest[]> {
 export interface DecisionResponse {
   id: string;
   accessRequestId: string;
-  decisionType: string;
+  outcome: string;
+  overridesRecommendation: boolean;
   status: string;
+  executionStatus: string;
 }
 
 export function submitDecision(

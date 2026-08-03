@@ -12,7 +12,11 @@ export function LoginPage() {
 
   const handleLogin = (token: string) => {
     if (login(token)) {
-      navigate('/', { replace: true });
+      const matchedUser = MOCK_USERS.find((user) => user.token === token);
+      navigate(
+        matchedUser?.role === 'GOVERNANCE_APPROVER' ? '/governance' : '/',
+        { replace: true },
+      );
     }
   };
 

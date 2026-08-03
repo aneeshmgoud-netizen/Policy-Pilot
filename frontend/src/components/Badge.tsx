@@ -1,15 +1,19 @@
-import type { AiDecision, HumanDecisionType, RequestStatus } from '../types';
+import type { AiDecision, DecisionOutcome, RequestStatus } from '../types';
 
 export function DecisionBadge({
   decision,
 }: {
-  decision: AiDecision | HumanDecisionType;
+  decision: AiDecision | DecisionOutcome;
 }) {
   return (
     <span className={`badge badge-decision badge-${decision.toLowerCase()}`}>
       {decision}
     </span>
   );
+}
+
+export function OverrideBadge() {
+  return <span className="badge badge-decision badge-override">override</span>;
 }
 
 export function StatusBadge({ status }: { status: RequestStatus }) {
