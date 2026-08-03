@@ -1,9 +1,9 @@
 # POL-DATA-001: Enterprise Data Governance and Analytics Access Policy
 
 **Document Reference:** POL-DATA-001  
-**Version:** 3.4.1  
+**Version:** 3.7.0  
 **Classification:** Internal Corporate Policy  
-**Effective Date:** January 15, 2025  
+**Effective Date:** February 1, 2026  
 **Review Cycle:** Annual  
 **Document Owner:** Office of the Chief Data Officer & Global Data Governance Council  
 **Applies To:** All full-time employees, contractors, temporary staff, and third-party vendors accessing enterprise analytics platforms, centralized data warehouses, and reporting environments across all enterprise business units.
@@ -51,12 +51,24 @@ Self-service requests for `FIN_DATASET_EDIT` are subject to strict multi-stage a
 
 Furthermore, standing or permanent write access to production financial datasets is explicitly prohibited by enterprise security standards. All approved grants of `FIN_DATASET_EDIT` must be **strictly time-boxed to a maximum duration of ninety (90) calendar days** from the date of provisioning. Upon reaching the 90-day threshold, access automatically expires unless a formal renewal request is submitted, secondary approval from `CC-GOV-01` is re-obtained, and updated business justification is documented. Any self-service request seeking `FIN_DATASET_EDIT` without documented secondary approval from a Data Governance Owner, or any request seeking indefinite/un-bounded write access, must be immediately escalated by the IT administrator to the Data Governance review queue.
 
-### 3.3 Billing Export Access Protocol (`BILLING_EXPORT`)
+### 3.3 Dataset Administration Entitlement (`FIN_DATASET_ADMIN`)
+`FIN_DATASET_ADMIN` grants the highest tier of `DATA_WAREHOUSE` access: authority to modify underlying schemas, reconfigure ingestion pipelines, connect or disconnect upstream data sources, and manage the analytical environment `FIN_DATASET_EDIT` and `FIN_DATASET_READ` operate against. Because a schema or pipeline change can silently alter the meaning of every downstream financial report without any individual dataset-edit review catching it, `FIN_DATASET_ADMIN` is classified as a maximum-risk tier 1 entitlement, more severe than `FIN_DATASET_EDIT`.
+
+Self-service requests for `FIN_DATASET_ADMIN` require both direct department manager validation and explicit secondary approval from a Data Governance Owner (`CC-GOV-01`), mirroring Section 3.2, plus formal sign-off from the Global Data Governance Council given the entitlement's structural (not merely transactional) impact. `FIN_DATASET_ADMIN` is never provisioned on a standing basis; all grants are strictly time-boxed to a maximum of ninety (90) calendar days, consistent with the elevated-access provisions of `POL-GOV-000` Section 3.3.
+
+### 3.4 Billing Export Access Protocol (`BILLING_EXPORT`)
 Bulk financial data extraction and billing report export capabilities within `DATA_WAREHOUSE` are governed under the `BILLING_EXPORT` entitlement. This capability supports routine invoicing reconciliation, billing ledger audits, revenue accounting, and operational financial analysis. Eligibility for `BILLING_EXPORT` is restricted to verified financial operations specialists and billing analysts assigned to the Finance Operations department under Cost Center `CC-FIN-12`.
 
 Self-service requests for `BILLING_EXPORT` submitted by eligible personnel within `CC-FIN-12` require initial business justification detailing the operational reporting requirement. **Requests for the `BILLING_EXPORT` entitlement submitted by verified personnel within Finance Operations (`CC-FIN-12`) require direct managerial approval from a Finance Operations supervisor.** Upon manager approval, `BILLING_EXPORT` is provisioned on a standard ongoing basis subject to mandatory semi-annual access recertification campaigns, provided the requester holds no conflicting dataset edit entitlements under Section 5.1.
 
-### 3.4 Non-Employee and Contractor Access Considerations
+### 3.5 Customer Data Access Tiers (`CUSTOMER_PII_READ`, `CUSTOMER_METADATA_READ`)
+`DATA_WAREHOUSE` hosts two distinct classes of customer-derived data, and this policy deliberately provisions them as separate entitlements rather than a single "customer data" grant, so that eligibility and approval scale with the sensitivity of what is actually being accessed — see `POL-STD-004` for the underlying classification taxonomy.
+
+**`CUSTOMER_METADATA_READ`** covers de-identified and aggregate customer analytics — transaction volumes, product usage counts, and cohort-level statistics that cannot be traced back to an individual customer. This is a Tier 2/3 (Internal/Confidential) entitlement under `POL-STD-004`. Employees assigned to Finance Analytics (`CC-FIN-07`) or Finance Operations (`CC-FIN-12`) may request `CUSTOMER_METADATA_READ` under the standard self-service workflow described in Section 3.1; it is provisioned on an ongoing basis subject to standard semi-annual recertification.
+
+**`CUSTOMER_PII_READ`** covers directly identifying customer information — names, account numbers, government identifiers, and transaction-level detail tied to a named individual. This is a Tier 4 (Restricted) entitlement under `POL-STD-004`, subject to GDPR Article 32 technical safeguard requirements. Self-service requests for `CUSTOMER_PII_READ` require the same secondary Data Governance Owner approval (`CC-GOV-01`) and 90-day time-boxing mandated for `FIN_DATASET_EDIT` under Section 3.2 — direct manager sign-off alone is insufficient. Requests for `CUSTOMER_PII_READ` that do not articulate a specific, time-bound business need referencing an individual customer investigation or a named compliance obligation must be escalated rather than approved on standard justification alone.
+
+### 3.6 Non-Employee and Contractor Access Considerations
 Contractors, external consultants, and non-employee personnel embedded within qualifying financial cost centers—specifically Finance Analytics (`CC-FIN-07`) or Finance Operations (`CC-FIN-12`)—frequently require analytical read access to support ongoing financial modeling and operational reporting. Such individuals may submit self-service access requests for the `FIN_DATASET_READ` entitlement via the standard self-service portal.
 
 While Section 3.1 establishes standard single-level manager approval for personnel operating within primary financial cost centers, non-employee identities remain subject to enterprise-wide third-party governance controls set forth in `POL-GOV-000` Appendix D (Vendor and Third-Party Access Governance), which mandates explicit corporate director sponsorship and heightened authentication controls for external personnel. Policy governing whether standard operational manager sign-off under Section 3.1 is sufficient on its own to provision `FIN_DATASET_READ` for embedded contractors, or whether verified director sponsorship per `POL-GOV-000` Appendix D must be separately confirmed prior to provisioning, is governed under inter-departmental review protocols. Administrators and automated review engines evaluating contractor requests for analytical read access must verify applicable departmental sponsorship evidence.
@@ -72,6 +84,11 @@ The Restricted Reporting Environment (`REPORTING_ENV`) hosts pre-release financi
 Self-service access requests for `RESTRICTED_REPORTING_TEMP` are limited to employees assigned to active, documented executive reporting projects or statutory compliance audits. To prevent credential accumulation in high-risk environments, `RESTRICTED_REPORTING_TEMP` is governed by mandatory time-boxing provisions.
 
 Access granted under `RESTRICTED_REPORTING_TEMP` must be strictly temporary, with automated system expiration pre-configured to **not exceed ninety (90) calendar days**. Provisioning requires a detailed project tracking identifier, primary manager approval, and secondary validation by the designated System Owner for `REPORTING_ENV`. Requests seeking standing, permanent, or un-bounded access to `REPORTING_ENV` violate enterprise least-privilege standards and must be denied or escalated for formal executive exception review.
+
+### 4.3 Executive Dashboard View Entitlement (`EXEC_DASHBOARD_VIEW`)
+`EXEC_DASHBOARD_VIEW` grants read-only access to published, already-finalized executive summary dashboards within `REPORTING_ENV` — aggregate KPIs and board-level reporting views that have already cleared the disclosure review described in Section 4.1, as distinct from the pre-release and unannounced materials `RESTRICTED_REPORTING_TEMP` governs. Because `EXEC_DASHBOARD_VIEW` carries no access to pre-release or unannounced figures and no modification capability, it is classified as a standard, low-risk entitlement.
+
+Self-service requests for `EXEC_DASHBOARD_VIEW` require only standard single-level manager approval, without the secondary System Owner validation or time-boxing mandated for `RESTRICTED_REPORTING_TEMP`. Upon approval, `EXEC_DASHBOARD_VIEW` is provisioned on an ongoing standing basis subject to mandatory annual access recertification.
 
 ---
 
@@ -109,3 +126,6 @@ All access grants across `DATA_WAREHOUSE` and `REPORTING_ENV` generate append-on
 | 2.1.0 | 2023-08-14 | Office of the CISO | Incorporated SOC 2 CC6.1 criteria and mandatory manager approval protocols. |
 | 3.0.0 | 2024-05-20 | Data Governance Council | Added 90-day time-boxing mandate for `FIN_DATASET_EDIT` and secondary `CC-GOV-01` sign-off. |
 | 3.4.1 | 2025-01-15 | Global Data Risk Committee | Updated SoD-DATA-01 conflict rules and added non-finance cost center restriction protocols. |
+| 3.5.0 | 2026-02-01 | Global Data Risk Committee | Added `CUSTOMER_PII_READ` and `CUSTOMER_METADATA_READ` customer data access tiers under Section 3.4. |
+| 3.6.0 | 2026-02-01 | Global Data Risk Committee | Added `FIN_DATASET_ADMIN` maximum-risk entitlement under Section 3.3; renumbered subsequent Section 3 subsections. |
+| 3.7.0 | 2026-02-01 | Global Data Risk Committee | Added `EXEC_DASHBOARD_VIEW` low-risk entitlement under new Section 4.3. |

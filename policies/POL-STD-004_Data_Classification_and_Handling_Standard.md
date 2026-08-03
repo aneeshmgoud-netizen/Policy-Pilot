@@ -1,9 +1,9 @@
 # POL-STD-004: Enterprise Data Classification and Handling Standard
 
 **Document Reference:** POL-STD-004  
-**Version:** 2.2.0  
+**Version:** 2.3.0  
 **Classification:** Internal Corporate Standard  
-**Effective Date:** October 1, 2024  
+**Effective Date:** February 1, 2026  
 **Review Cycle:** Annual  
 **Document Owner:** Global Information Security Office & Data Protection Officer  
 **Applies To:** All employees, contractors, system owners, and data custodians handling corporate information assets across all global business units and operational regions.
@@ -36,13 +36,15 @@ Corporate information assets are categorized into four distinct classification t
 
 ### 2.3 Tier 3: Confidential Information
 * **Definition:** Sensitive business data created during routine commercial operations. Unauthorized disclosure could cause moderate financial loss, competitive disadvantage, or legal friction.
-* **Examples:** Draft financial performance summaries, customer transaction statistics, department budget plans, vendor contracts, internal audit reports, engineering architectural blueprints.
+* **Examples:** Draft financial performance summaries, de-identified/aggregate customer transaction statistics (`CUSTOMER_METADATA_READ`), department budget plans, vendor contracts, internal audit reports, engineering architectural blueprints.
 * **Handling Controls:** Mandatory AES-256 bit encryption at rest; TLS 1.3 encryption in transit; access restricted strictly to authenticated internal staff with documented business necessity; watermark enforcement on exported PDF views.
 
 ### 2.4 Tier 4: Restricted Information
 * **Definition:** Highly sensitive information subject to strict legal, statutory, or contractual protection. Unauthorized disclosure would cause severe financial loss, regulatory fines, executive liability, or catastrophic reputational damage.
-* **Examples:** Payment card cardholder data (PCI-DSS), unannounced financial earnings figures, bulk billing transaction exports, employee payroll master ledgers, sensitive analytics datasets, infrastructure master encryption keys.
+* **Examples:** Payment card cardholder data (PCI-DSS), directly identifying customer records including names, account numbers, and government identifiers (`CUSTOMER_PII_READ`), unannounced financial earnings figures, bulk billing transaction exports, employee payroll master ledgers, sensitive analytics datasets, production secrets and infrastructure master encryption keys (`PROD_SECRETS_ADMIN`).
 * **Handling Controls:** Mandatory column-level database encryption; mandatory multi-factor authentication for data access; continuous real-time audit logging; mandatory approval by designated Data Custodians prior to any bulk data movement or analytical schema transfer.
+
+**Note on `CUSTOMER_PII_READ` vs. `CUSTOMER_METADATA_READ`:** these two entitlements govern the same underlying `DATA_WAREHOUSE` customer dataset at two different classification tiers, not two different systems. The determining factor is whether the data can be traced back to an individual customer (Tier 4, `CUSTOMER_PII_READ`) or has been aggregated/de-identified (Tier 3, `CUSTOMER_METADATA_READ`) — see `POL-DATA-001` Section 3.5 for the corresponding entitlement eligibility and approval rules.
 
 ---
 
@@ -65,7 +67,7 @@ Physical hard drives, server storage arrays, and decommissioned storage media co
 
 This standard operates alongside enterprise logical access control policies by providing the foundational data classification labels applied to corporate repositories and analytical datasets.
 
-While this document governs technical handling safeguards (including encryption baselines, retention schedules, and Data Custodian sign-offs for bulk Tier 4 transfers), specific identity entitlement eligibility, role provisioning workflows, and separation-of-duties rules for application access keys (such as `FIN_DATASET_EDIT`, `PROD_DEPLOYER`, `PAYMENT_CREATE`, `INFRA_ADMIN`, `PAYROLL_EDIT`, or `RESTRICTED_REPORTING_TEMP`) are detailed within primary domain policies:
+While this document governs technical handling safeguards (including encryption baselines, retention schedules, and Data Custodian sign-offs for bulk Tier 4 transfers), specific identity entitlement eligibility, role provisioning workflows, and separation-of-duties rules for application access keys (such as `FIN_DATASET_EDIT`, `PROD_DEPLOYER`, `PAYMENT_CREATE`, `INFRA_ADMIN`, `PROD_SECRETS_ADMIN`, `PAYROLL_EDIT`, `RESTRICTED_REPORTING_TEMP`, `CUSTOMER_PII_READ`, or `CUSTOMER_METADATA_READ`) are detailed within primary domain policies:
 - `POL-DATA-001`: Governs Data Warehouse and Reporting Environment access rules.
 - `POL-SEC-002`: Governs Cloud Console and Deployment Pipeline security controls.
 - `POL-FIN-003`: Governs Vendor Payments and HR Payroll Separation of Duties.
@@ -80,3 +82,4 @@ While this document governs technical handling safeguards (including encryption 
 | 1.0.0 | 2021-06-15 | Information Security Office | Initial release of enterprise data classification standard. |
 | 2.0.0 | 2023-01-20 | Data Protection Officer | Updated encryption baselines to AES-256 and TLS 1.3 protocols. |
 | 2.2.0 | 2024-10-01 | Global Security Council | Added Tier 4 Restricted handling rules for financial analytics datasets. |
+| 2.3.0 | 2026-02-01 | Global Security Council | Classified `CUSTOMER_PII_READ` (Tier 4) vs. `CUSTOMER_METADATA_READ` (Tier 3) and `PROD_SECRETS_ADMIN` (Tier 4); updated domain-policy cross-reference list. |
