@@ -6,20 +6,25 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
-import type { Response } from 'express';
-import { redactPiiInText } from './pii.util';
+import type { Request, Response } from 'express';
 
 // Global exception filter guaranteeing that no unexpected error ever leaks a
-// stack trace or internal detail to the client. HttpExceptions (including the
-// ValidationPipe's 400s and the API guard's 401s) pass through with their
-// intended, already-safe response body. Anything else is logged server-side
-// and returned as an opaque 500 so implementation details never reach callers.
+// stack trace or internal detail to the client OR the application log.
+// HttpExceptions (including the ValidationPipe's 400s and the API guard's
+// 401s) pass through with their intended, already-safe response body — that
+// API surface is designed to be exposed. Anything else is an unanticipated
+// failure (a DB error, a downstream timeout, a bug): its message/stack/cause
+// could carry a connection string, an internal hostname, a bearer token, or
+// an employee ID, so the catch below deliberately never reads it. Only a
+// stable code plus safe, request-shape metadata (method, route path — both
+// server-defined, never user data) is logged.
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
   private readonly logger = new Logger(AllExceptionsFilter.name);
 
   catch(exception: unknown, host: ArgumentsHost): void {
-    const response = host.switchToHttp().getResponse<Response>();
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
 
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
@@ -32,10 +37,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return;
     }
 
-    // Masked defensively: an unanticipated error (e.g. a raw DB constraint
-    // message) could otherwise carry an EMP-/CC- identifier straight into logs.
-    const detail = exception instanceof Error ? exception.stack : String(exception);
-    this.logger.error('Unhandled exception', redactPiiInText(detail ?? ''));
+    const request = ctx.getRequest<Request>();
+    this.logger.error(
+      `UNHANDLED_EXCEPTION method=${request.method} route=${request.route?.path ?? request.path}`,
+    );
     response.status(HttpStatus.INTERNAL_SERVER_ERROR).json({
       statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
       message: 'Internal server error',

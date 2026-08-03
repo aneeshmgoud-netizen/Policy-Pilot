@@ -32,6 +32,17 @@ export const KNOWN_ENTITLEMENTS = [
   'PROD_DEPLOYER',
   'PROD_CHANGE_APPROVER',
   'INFRA_ADMIN',
+  'PROD_SECRETS_ADMIN',
+  'CUSTOMER_PII_READ',
+  'CUSTOMER_METADATA_READ',
+  'FIN_DATASET_ADMIN',
+  'STAGING_DEPLOYER',
+  'PIPELINE_ADMIN',
+  'EXEC_DASHBOARD_VIEW',
+  'INFRA_READONLY',
+  'VENDOR_MASTER_EDIT',
+  'PAYROLL_READ',
+  'COMPENSATION_BAND_ADMIN',
 ] as const;
 
 // Cost-center prefix -> department, per the enterprise org hierarchy the

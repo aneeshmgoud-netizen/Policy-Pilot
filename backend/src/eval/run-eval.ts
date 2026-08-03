@@ -1,10 +1,10 @@
 // Evaluation harness for the RAG retrieval + AI Recommendation Agent pipeline
 // (assignment Section 4.8). Runs every case in ../../golden-dataset.json
-// through the *real* RagService + AgentService — i.e. real OpenAI embedding
-// and chat-completion calls, and a real pgvector similarity search against
-// whatever policies are currently ingested — and reports schema validity,
-// retrieval quality, grounding/faithfulness, decision correctness, citation
-// quality, latency percentiles, and estimated cost.
+// through the same RagService + AgentService + RecommendationGroundingService
+// pipeline production uses: real OpenAI embedding/chat calls, real pgvector
+// policy retrieval, and the fail-closed policy/precedent grounding gates. It
+// reports schema validity, retrieval quality, grounding/faithfulness, decision
+// correctness, citation quality, latency percentiles, and estimated cost.
 //
 // This calls OpenAI once per case for embeddings and once for the chat
 // completion (more on retries): running it spends real API credit. It is
@@ -24,12 +24,20 @@ import {
 import {
   AgentAccessRequest,
   AgentEntitlementSnapshot,
-  Recommendation,
+  AgentOperatingRule,
 } from '../agent/agent.types';
 import {
-  buildSodConflictRecommendation,
-  resolveCitations,
-} from '../queue/access-request.processor';
+  RetrievedPrecedent,
+  toAgentPrecedent,
+} from '../precedents/precedent-retrieval.service';
+import { ValidatedCitation } from '../queue/policy-evidence-selection.util';
+import { buildSodConflictRecommendation } from '../queue/access-request.processor';
+import {
+  GroundedRecommendationOutcome,
+  RecommendationGroundingService,
+  checkOperatingRuleReviewCompleteness,
+  checkPrecedentReviewCompleteness,
+} from '../queue/recommendation-grounding.service';
 import { EmbeddingsService } from '../rag/embeddings.service';
 import { RagService, RetrievedChunk } from '../rag/rag.service';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -44,6 +52,8 @@ interface GoldenCase {
   input: {
     accessRequest: AgentAccessRequest;
     entitlementSnapshot: AgentEntitlementSnapshot;
+    retrievedPrecedents?: RetrievedPrecedent[];
+    operatingRules?: AgentOperatingRule[];
   };
   retrieval: {
     expectedDocument: string | null;
@@ -59,6 +69,7 @@ interface GoldenCase {
     allowLowConfidence?: boolean;
     structuralOnly?: boolean;
     injectionResistance?: boolean;
+    expectedConflictEscalate?: boolean;
     decisionNote?: string;
     // When set, verifies the recommendation came from the named deterministic
     // code path (e.g. 'system:sod-conflict-rule') rather than the LLM — i.e.
@@ -85,7 +96,22 @@ interface CaseResult {
   rawCitationCount: number;
   resolvedCitationCount: number;
   citationQualityOk: boolean | null;
+  // Reason codes for selected source IDs that failed deterministic resolution.
+  rejectionReasons: string[];
   injectionResisted: boolean | null;
+  conflictEscalationCorrect: boolean | null;
+  validatedPrecedentCitationCount: number;
+  // Did the MODEL itself account for every retrieved precedent in
+  // precedent_review? Measured on the raw model output, before the grounding
+  // gate compensates — this is the behavior the completeness check exists to
+  // catch, and the number the report should be honest about. null when the
+  // case retrieved no precedent, so there was nothing to account for.
+  precedentReviewComplete: boolean | null;
+  precedentReviewIssues: string[];
+  // Same measurement, for governance-approved guidance. null when no rule was
+  // in scope for the case.
+  operatingRuleReviewComplete: boolean | null;
+  operatingRuleReviewIssues: string[];
   confidence: number | null;
   latencyMs: number | null;
   costUsd: number;
@@ -124,16 +150,16 @@ function checkRetrieval(
 }
 
 function checkCitationQuality(
-  resolved: ReturnType<typeof resolveCitations>,
+  validated: ValidatedCitation[],
   expectedDocument: string | null,
 ): boolean {
-  if (resolved.length === 0) {
+  if (validated.length === 0) {
     return false;
   }
   if (!expectedDocument) {
     return true;
   }
-  return resolved.some((c) => c.documentName.startsWith(expectedDocument));
+  return validated.some((c) => c.documentName.startsWith(expectedDocument));
 }
 
 function percentile(sorted: number[], p: number): number | null {
@@ -154,8 +180,11 @@ async function runCase(
   goldenCase: GoldenCase,
   ragService: RagService,
   agentService: AgentService,
+  groundingService: RecommendationGroundingService,
 ): Promise<CaseResult> {
   const { accessRequest, entitlementSnapshot } = goldenCase.input;
+  const retrievedPrecedents = goldenCase.input.retrievedPrecedents ?? [];
+  const operatingRules = goldenCase.input.operatingRules ?? [];
   const result: CaseResult = {
     id: goldenCase.id,
     category: goldenCase.category,
@@ -167,7 +196,14 @@ async function runCase(
     rawCitationCount: 0,
     resolvedCitationCount: 0,
     citationQualityOk: null,
+    rejectionReasons: [],
     injectionResisted: null,
+    conflictEscalationCorrect: null,
+    validatedPrecedentCitationCount: 0,
+    precedentReviewComplete: null,
+    precedentReviewIssues: [],
+    operatingRuleReviewComplete: null,
+    operatingRuleReviewIssues: [],
     confidence: null,
     latencyMs: null,
     costUsd: 0,
@@ -178,17 +214,23 @@ async function runCase(
   };
 
   // Mirrors AccessRequestProcessor.generateRecommendation: an unmitigated SoD
-  // conflict is deterministically DENY, computed entirely from the snapshot,
-  // and never reaches RAG retrieval or the LLM. Using the exact same exported
-  // function (rather than re-deriving the same check here) means GD-04 tests
-  // the real short-circuit, not a reimplementation of it.
+  // conflict starts as a deterministic DENY computed from the snapshot and
+  // never reaches the LLM or general RAG flow. The grounding service may still
+  // run targeted policy retrieval to verify/cite the SoD rule. Using the same
+  // exported function means GD-04 tests the real short-circuit, not a
+  // reimplementation of it.
   const shortCircuited = buildSodConflictRecommendation(entitlementSnapshot);
 
   let chunks: RetrievedChunk[] = [];
   let agentResult: Awaited<ReturnType<AgentService['recommend']>>;
+  let grounded: GroundedRecommendationOutcome;
 
   if (shortCircuited) {
     agentResult = shortCircuited;
+    grounded = await groundingService.groundSodDenial(
+      shortCircuited,
+      entitlementSnapshot.sodConflicts,
+    );
   } else {
     try {
       chunks = await ragService.retrieveRelevantChunks(
@@ -207,21 +249,33 @@ async function runCase(
         accessRequest,
         entitlementSnapshot,
         retrievedChunks: chunks.map((c) => ({
+          id: c.id,
           documentName: c.documentName,
           section: c.section,
           content: c.content,
         })),
+        // Same projection the production worker uses, so an eval run can
+        // never be scored against a prompt input the real pipeline wouldn't
+        // have produced.
+        retrievedPrecedents: retrievedPrecedents.map(toAgentPrecedent),
+        operatingRules,
       });
     } catch (err) {
       result.schemaValid = !(err instanceof RecommendationValidationError);
       result.error = err instanceof Error ? err.message : String(err);
       return result;
     }
+    grounded = groundingService.groundLlmRecommendation(
+      agentResult,
+      chunks,
+      retrievedPrecedents,
+      operatingRules,
+    );
   }
 
   result.schemaValid = true;
   result.attemptNumber = agentResult.attemptNumber;
-  result.confidence = agentResult.recommendation.confidence;
+  result.confidence = grounded.recommendation.confidence;
   result.latencyMs = agentResult.usage.latencyMs;
   result.costUsd = agentResult.usage.estimatedCostUsd;
   result.modelName = agentResult.modelName;
@@ -229,12 +283,52 @@ async function runCase(
     result.modelNameOk = agentResult.modelName === goldenCase.expected.expectedModelName;
   }
 
-  const recommendation: Recommendation = agentResult.recommendation;
+  const recommendation = grounded.recommendation;
   result.decision = recommendation.decision;
-  result.rawCitationCount = recommendation.policy_citations.length;
+  // Counted from the model's OWN selections, not the grounded result. The
+  // deterministic SoD path selects no source ids while groundSodDenial can
+  // supply an authoritative citation; mixing the two would make the
+  // resolved/selected metric exceed 100%.
+  result.rawCitationCount =
+    agentResult.recommendation.policy_citation_refs.length;
+  result.validatedPrecedentCitationCount =
+    grounded.precedentCitations.length;
 
-  const resolved = resolveCitations(recommendation.policy_citations, chunks);
-  result.resolvedCitationCount = resolved.length;
+  // Deliberately scored against agentResult (the model's own output), not
+  // `grounded`: once the gate has forced ESCALATE and rewritten the result, a
+  // check against the grounded recommendation would measure the backstop
+  // rather than the behavior it is backstopping.
+  if (retrievedPrecedents.length > 0) {
+    const reviewIssues = checkPrecedentReviewCompleteness(
+      agentResult.recommendation,
+      retrievedPrecedents,
+    );
+    result.precedentReviewComplete = reviewIssues.length === 0;
+    result.precedentReviewIssues = reviewIssues.map(
+      (issue) => `${issue.precedentId}:${issue.reason}`,
+    );
+  }
+
+  if (operatingRules.length > 0) {
+    const ruleIssues = checkOperatingRuleReviewCompleteness(
+      agentResult.recommendation,
+      operatingRules,
+    );
+    result.operatingRuleReviewComplete = ruleIssues.length === 0;
+    result.operatingRuleReviewIssues = ruleIssues.map(
+      (issue) => `${issue.ruleId}:${issue.reason}`,
+    );
+  }
+
+  // Source-resolution measures the model contract. The deterministic SoD
+  // path selects no source ids and materializes its own citation, so including
+  // that citation would make resolved selections exceed model selections.
+  result.resolvedCitationCount = shortCircuited
+    ? 0
+    : grounded.citations.length;
+  result.rejectionReasons = Object.entries(
+    grounded.audit.rejectionReasonCounts,
+  ).map(([reason, count]) => `${reason} (${count})`);
 
   if (!goldenCase.expected.structuralOnly) {
     const expectedDecision = goldenCase.expected.decision;
@@ -248,13 +342,19 @@ async function runCase(
 
   if (goldenCase.expected.requireCitations) {
     result.citationQualityOk = checkCitationQuality(
-      resolved,
+      grounded.citations,
       goldenCase.retrieval.expectedDocument,
     );
   }
 
   if (goldenCase.expected.injectionResistance) {
     result.injectionResisted = recommendation.decision !== 'APPROVE';
+  }
+
+  if (goldenCase.expected.expectedConflictEscalate !== undefined) {
+    result.conflictEscalationCorrect =
+      grounded.audit.convertedToEscalateForConflict ===
+      goldenCase.expected.expectedConflictEscalate;
   }
 
   return result;
@@ -276,6 +376,7 @@ async function main(): Promise<void> {
     apiKey: process.env.OPENAI_API_KEY,
     model: process.env.OPENAI_CHAT_MODEL,
   });
+  const groundingService = new RecommendationGroundingService(ragService);
 
   console.log(
     `Running golden dataset ${dataset.datasetVersion} (${dataset.cases.length} cases) against the live RAG + Agent pipeline...\n`,
@@ -284,12 +385,20 @@ async function main(): Promise<void> {
   const results: CaseResult[] = [];
   for (const goldenCase of dataset.cases) {
     process.stdout.write(`  ${goldenCase.id} ... `);
-    const result = await runCase(goldenCase, ragService, agentService);
+    const result = await runCase(
+      goldenCase,
+      ragService,
+      agentService,
+      groundingService,
+    );
     results.push(result);
     const shortCircuitNote =
       result.modelName && result.modelName !== agentService.model ? ` (${result.modelName})` : '';
     console.log(
-      result.error ? `ERROR (${result.error})` : `decision=${result.decision}${shortCircuitNote}`,
+      result.error
+        ? `ERROR (${result.error})`
+        : `decision=${result.decision}${shortCircuitNote}, ` +
+          `validatedPrecedents=${result.validatedPrecedentCitationCount}`,
     );
   }
 
@@ -317,6 +426,29 @@ async function main(): Promise<void> {
   const injectionScored = results.filter((r) => r.injectionResisted !== null);
   const injectionResisted = injectionScored.filter((r) => r.injectionResisted).length;
 
+  const conflictScored = results.filter(
+    (r) => r.conflictEscalationCorrect !== null,
+  );
+  const conflictCorrect = conflictScored.filter(
+    (r) => r.conflictEscalationCorrect,
+  ).length;
+
+  // Scored only on cases that actually retrieved precedent — elsewhere there
+  // was nothing for the model to account for.
+  const precedentReviewScored = results.filter(
+    (r) => r.precedentReviewComplete !== null,
+  );
+  const precedentReviewComplete = precedentReviewScored.filter(
+    (r) => r.precedentReviewComplete === true,
+  ).length;
+
+  const ruleReviewScored = results.filter(
+    (r) => r.operatingRuleReviewComplete !== null,
+  );
+  const ruleReviewComplete = ruleReviewScored.filter(
+    (r) => r.operatingRuleReviewComplete === true,
+  ).length;
+
   const latencies = results
     .map((r) => r.latencyMs)
     .filter((v): v is number => v !== null)
@@ -330,6 +462,9 @@ async function main(): Promise<void> {
       r.decisionCorrect === false ||
       r.citationQualityOk === false ||
       r.injectionResisted === false ||
+      r.conflictEscalationCorrect === false ||
+      r.precedentReviewComplete === false ||
+      r.operatingRuleReviewComplete === false ||
       r.modelNameOk === false,
   );
 
@@ -337,9 +472,9 @@ async function main(): Promise<void> {
   console.log(`Schema-valid output rate:        ${rate(schemaValidCount, total)}`);
   console.log(`Retrieval quality (right doc):    ${rate(retrievalHits, retrievalScored.length)}`);
   console.log(
-    `Grounding / faithfulness:         ${
+    `Policy source resolution:         ${
       totalRawCitations === 0
-        ? 'N/A (no citations produced)'
+        ? 'N/A (no policy sources selected)'
         : rate(totalResolvedCitations, totalRawCitations)
     }`,
   );
@@ -347,6 +482,24 @@ async function main(): Promise<void> {
   console.log(`Citation quality:                 ${rate(citationOk, citationScored.length)}`);
   console.log(
     `Prompt-injection resistance:     ${rate(injectionResisted, injectionScored.length)}`,
+  );
+  console.log(
+    `Precedent conflict-escalation correctness: ${rate(conflictCorrect, conflictScored.length)}`,
+  );
+  // The headline number for the omission failure this system was built to
+  // catch: how often the MODEL accounted for every precedent it was shown,
+  // before the deterministic gate compensated for it.
+  console.log(
+    `Operating-rule-review completeness (model, pre-gate): ${rate(
+      ruleReviewComplete,
+      ruleReviewScored.length,
+    )}`,
+  );
+  console.log(
+    `Precedent-review completeness (model, pre-gate): ${rate(
+      precedentReviewComplete,
+      precedentReviewScored.length,
+    )}`,
   );
   console.log(
     `Latency p50 / p95 (ms):           ${percentile(latencies, 0.5) ?? 'N/A'} / ${
@@ -369,8 +522,35 @@ async function main(): Promise<void> {
           : f.expectedDecision;
         reasons.push(`decision mismatch (expected ${expected}, got ${f.decision})`);
       }
-      if (f.citationQualityOk === false) reasons.push('citations missing or ungrounded');
+      if (f.citationQualityOk === false) {
+        reasons.push(
+          `policy sources missing or unresolved${
+            f.rejectionReasons.length > 0 ? `: ${f.rejectionReasons.join('; ')}` : ''
+          }`,
+        );
+      }
       if (f.injectionResisted === false) reasons.push('complied with injected instruction (APPROVE)');
+      if (f.conflictEscalationCorrect === false) {
+        reasons.push('precedent conflict was not converted to ESCALATE as expected');
+      }
+      if (f.operatingRuleReviewComplete === false) {
+        reasons.push(
+          `model left approved operating guidance unaccounted for${
+            f.operatingRuleReviewIssues.length > 0
+              ? ` (${f.operatingRuleReviewIssues.join('; ')})`
+              : ''
+          }`,
+        );
+      }
+      if (f.precedentReviewComplete === false) {
+        reasons.push(
+          `model left retrieved precedent unaccounted for in precedent_review${
+            f.precedentReviewIssues.length > 0
+              ? ` (${f.precedentReviewIssues.join('; ')})`
+              : ''
+          }`,
+        );
+      }
       if (f.modelNameOk === false)
         reasons.push(`deterministic short-circuit did not engage (modelName was ${f.modelName})`);
       console.log(`  - ${f.id} [${f.category}]: ${reasons.join('; ')}`);

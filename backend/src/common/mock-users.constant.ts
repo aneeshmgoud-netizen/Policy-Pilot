@@ -7,8 +7,10 @@
 // tokens rather than issued ones. A production deployment would replace this
 // with real session/OAuth2 auth and a users table; the shape (id, role) and
 // the rule that only role === 'REVIEWER' may act on decisions would carry
-// over unchanged.
-export type DashboardRole = 'REVIEWER' | 'VIEWER';
+// over unchanged. GOVERNANCE_APPROVER is another mock-only role for the same
+// reason; the real boundary is that reviewer and governance credentials are
+// always distinct, while production would enforce that through real RBAC.
+export type DashboardRole = 'REVIEWER' | 'VIEWER' | 'GOVERNANCE_APPROVER';
 
 export interface MockDashboardUser {
   token: string;
@@ -35,6 +37,12 @@ export const MOCK_DASHBOARD_USERS: MockDashboardUser[] = [
     id: 'viewer:dana',
     displayName: 'Dana Ortiz (view-only)',
     role: 'VIEWER',
+  },
+  {
+    token: 'mock-token-governance',
+    id: 'governance:priya',
+    displayName: 'Priya Anand (governance)',
+    role: 'GOVERNANCE_APPROVER',
   },
 ];
 

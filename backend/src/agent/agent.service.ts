@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
-import { buildMessagesV3, PROMPT_VERSION } from './prompts/v3.prompt';
+import { buildMessagesV6, PROMPT_VERSION } from './prompts/v6.prompt';
 import {
   Recommendation,
   RecommendationInput,
@@ -81,7 +81,7 @@ export class AgentService {
    * all attempts fail.
    */
   async recommend(input: RecommendationInput): Promise<RecommendationResult> {
-    const messages = buildMessagesV3(input);
+    const messages = buildMessagesV6(input);
     let lastError = '';
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {

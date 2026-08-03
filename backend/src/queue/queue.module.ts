@@ -5,9 +5,11 @@ import { ScheduleModule } from '@nestjs/schedule';
 import IORedis from 'ioredis';
 import { AgentModule } from '../agent/agent.module';
 import { EntitlementsModule } from '../entitlements/entitlements.module';
+import { PrecedentsModule } from '../precedents/precedents.module';
 import { RagModule } from '../rag/rag.module';
 import { AccessRequestProcessor } from './access-request.processor';
 import { ACCESS_REQUEST_QUEUE } from './queue.constants';
+import { RecommendationGroundingService } from './recommendation-grounding.service';
 import { StaleRequestSweeperService } from './stale-request-sweeper.service';
 
 @Module({
@@ -40,11 +42,16 @@ import { StaleRequestSweeperService } from './stale-request-sweeper.service';
       },
     }),
     EntitlementsModule,
+    PrecedentsModule,
     RagModule,
     AgentModule,
     ScheduleModule.forRoot(),
   ],
-  providers: [AccessRequestProcessor, StaleRequestSweeperService],
+  providers: [
+    AccessRequestProcessor,
+    StaleRequestSweeperService,
+    RecommendationGroundingService,
+  ],
   exports: [BullModule],
 })
 export class QueueModule {}

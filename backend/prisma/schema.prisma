@@ -73,12 +73,46 @@ enum Decision {
   @@map("decision")
 }
 
-enum HumanDecisionType {
-  APPROVE
+// The reviewer's final, unambiguous effect on the entitlement — decoupled
+// from whether it agrees with the AI recommendation. This replaces the old
+// APPROVE/DENY/OVERRIDE decisionType, which conflated "what happens" with
+// "did the reviewer disagree" and let an OVERRIDE always resolve to a grant
+// regardless of reviewer intent.
+enum ExecutionOutcome {
+  GRANT
   DENY
-  OVERRIDE
 
-  @@map("human_decision_type")
+  @@map("execution_outcome")
+}
+
+// Attribution for a stored recommendation: who actually authored the decision
+// and justification a reviewer reads. Without this, a deterministic override
+// by RecommendationGroundingService was indistinguishable from the model's own
+// judgment — same model_name, same (model-supplied) confidence, same UI
+// heading. See DecisionSource in queue/recommendation-grounding.service.ts.
+enum DecisionSource {
+  MODEL
+  SOD_RULE
+  GROUNDING_GATE
+
+  @@map("decision_source")
+}
+
+enum ExecutionStatus {
+  PENDING
+  // Claimed by a worker via compare-and-swap; distinct from PENDING so a
+  // second worker (or a duplicate job delivery) can never claim the same
+  // row concurrently. A row stuck here past STALE_PROCESSING_THRESHOLD_MS
+  // (worker crashed mid-flight) is reclaimable back to PENDING.
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  // Backfilled for a HumanDecision that predates this outbox table. We do
+  // not know whether the old synchronous ExecutionAdapter call actually
+  // ran, so this is deliberately not SUCCEEDED — it's an honest "unknown".
+  UNKNOWN_LEGACY
+
+  @@map("execution_status")
 }
 
 model AccessRequest {
@@ -99,10 +133,11 @@ model AccessRequest {
   createdAt           DateTime      @default(now()) @map("created_at")
   updatedAt           DateTime      @updatedAt @map("updated_at")
 
-  recommendations AiRecommendation[]
-  humanDecisions  HumanDecision[]
-  auditLogs       AuditLog[]
-  idempotencyKeys IdempotencyKey[]
+  recommendations  AiRecommendation[]
+  humanDecisions   HumanDecision[]
+  auditLogs        AuditLog[]
+  idempotencyKeys  IdempotencyKey[]
+  precedentRecords PrecedentRecord[]
 
   @@index([employeeId])
   @@index([status])
@@ -121,9 +156,33 @@ model AiRecommendation {
   attemptNumber   Int      @default(1) @map("attempt_number")
   createdAt       DateTime @default(now()) @map("created_at")
 
-  accessRequest  AccessRequest              @relation(fields: [accessRequestId], references: [id])
-  citations      AiRecommendationCitation[]
-  humanDecisions HumanDecision[]
+  // Provenance. `decision`/`justification`/`confidence` above are the
+  // EFFECTIVE recommendation — what the reviewer acts on, after grounding.
+  // modelDecision/modelConfidence record only an actual LLM proposal. They
+  // are null when the deterministic SoD rule bypassed the model.
+  // decisionSource identifies which layer produced the effective decision,
+  // so a grounding or SoD result is visible rather than inferred.
+  // Nullable with no default: rows written before this existed genuinely do
+  // not know their own provenance, and backfilling them with "MODEL" would
+  // assert something untrue about history (same reasoning as
+  // ExecutionStatus.UNKNOWN_LEGACY).
+  modelDecision   Decision?       @map("model_decision")
+  modelConfidence Float?          @map("model_confidence")
+  decisionSource  DecisionSource? @map("decision_source")
+
+  // OperatingRule ids that were in force and shown to the model when this
+  // recommendation was generated. Named "retrieved", not "applied": this
+  // records what the model was given, which is knowable at write time.
+  // Whether the model judged a rule applicable is its own
+  // operating_rule_review answer, verified by RecommendationGroundingService.
+  // A plain string array, mirroring RuleSuggestion.supportingDecisionIds — a
+  // revoked rule must not vanish from the history it did inform.
+  retrievedOperatingRuleIds String[] @map("retrieved_operating_rule_ids")
+
+  accessRequest      AccessRequest              @relation(fields: [accessRequestId], references: [id])
+  citations          AiRecommendationCitation[]
+  humanDecisions     HumanDecision[]
+  precedentCitations PrecedentCitation[]
 
   @@index([accessRequestId])
   @@map("ai_recommendations")
@@ -147,19 +206,101 @@ model AiRecommendationCitation {
 }
 
 model HumanDecision {
-  id                 String            @id @default(uuid()) @db.Uuid
-  accessRequestId    String            @map("access_request_id") @db.Uuid
-  aiRecommendationId String?           @map("ai_recommendation_id") @db.Uuid
-  reviewerId         String            @map("reviewer_id")
-  decision           HumanDecisionType
-  rationale          String?           @db.Text
-  createdAt          DateTime          @default(now()) @map("created_at")
+  id                      String           @id @default(uuid()) @db.Uuid
+  accessRequestId         String           @map("access_request_id") @db.Uuid
+  aiRecommendationId      String?          @map("ai_recommendation_id") @db.Uuid
+  reviewerId              String           @map("reviewer_id")
+  outcome                 ExecutionOutcome
+  // Deviation from the EFFECTIVE recommendation the reviewer was shown
+  // (post-grounding). This is the safety signal: it drives the mandatory
+  // rationale, so a reviewer acting against what the system put in front of
+  // them always has to explain why.
+  overridesRecommendation Boolean          @map("overrides_recommendation")
 
-  accessRequest    AccessRequest     @relation(fields: [accessRequestId], references: [id])
-  aiRecommendation AiRecommendation? @relation(fields: [aiRecommendationId], references: [id])
+  // Whether the reviewer agreed with what the MODEL itself proposed — the V2
+  // "did the reviewer agree with the AI" field. Deliberately separate from
+  // overridesRecommendation: when the grounding gate turns a model APPROVE
+  // into an ESCALATE, a human GRANT deviates from the system while agreeing
+  // with the AI, and recording that as a plain "override" both overstated
+  // disagreement and mislabelled the precedent summary built from it.
+  // Nullable: null means there was no model proposal to compare against.
+  agreedWithAi            Boolean?         @map("agreed_with_ai")
+  rationale               String?          @db.Text
+  createdAt               DateTime         @default(now()) @map("created_at")
 
-  @@index([accessRequestId])
+  accessRequest    AccessRequest      @relation(fields: [accessRequestId], references: [id])
+  aiRecommendation AiRecommendation?  @relation(fields: [aiRecommendationId], references: [id])
+  execution        DecisionExecution?
+  feedback         DecisionFeedback?
+
+  // One terminal decision per access request, enforced at the DB level (not
+  // just by the app checking status === RECOMMENDED first) so a race between
+  // two concurrent decision submissions can't both succeed.
+  @@unique([accessRequestId])
   @@map("human_decisions")
+}
+
+// Durable outbox record of the downstream execution attempt for a human
+// decision. One row per decision (unique FK) is what makes the *record*
+// idempotent — DB uniqueness alone does not make the *external* downstream
+// effect exactly-once. That guarantee instead depends on: (1) this row's id
+// being passed to ExecutionAdapter as a stable idempotency key on every
+// attempt (including retries and sweeper-recovered replays), and (2) the
+// downstream system (here, the mocked adapter) actually deduplicating on
+// that key. See DecisionExecutionProcessor and DecisionExecutionSweeperService.
+model DecisionExecution {
+  id              String           @id @default(uuid()) @db.Uuid
+  humanDecisionId String           @unique @map("human_decision_id") @db.Uuid
+  outcome         ExecutionOutcome
+  status          ExecutionStatus  @default(PENDING)
+  attempts        Int              @default(0)
+  // Fixed, operator-facing failure text derived *exclusively* from errorCode
+  // — never the raw exception message, and not a redacted form of it either;
+  // the exception body is never read at all. See execution-error.util.ts.
+  // Not exposed via the reviewer-facing API; errorCode is the safe field for
+  // that.
+  lastError       String?          @map("last_error") @db.Text
+  errorCode       String?          @map("error_code")
+  executedAt      DateTime?        @map("executed_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  // Record metadata ONLY. Deliberately never used to decide whether a
+  // PROCESSING row is stale: @updatedAt moves on every unrelated write
+  // (including a sweeper acquiring recovery ownership), which previously made
+  // a stale row look freshly-claimed and blocked the very recovery the
+  // sweeper had just enqueued. Processing staleness lives in the explicit
+  // processingLeaseExpiresAt lease below.
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  // Explicit worker lease. Set atomically together with status = PROCESSING
+  // when DecisionExecutionProcessor.claim() wins the CAS, and cleared on
+  // every transition out of PROCESSING (PENDING / SUCCEEDED / FAILED). A
+  // PROCESSING row whose lease is expired — or null, which can only mean the
+  // lease was never written — is reclaimable. This is the single source of
+  // truth for "did a worker die mid-flight".
+  processingLeaseExpiresAt DateTime? @map("processing_lease_expires_at")
+
+  // Fencing token for that lease: a fresh value per claim, which the claiming
+  // worker must present to write ANY state transition for this row. Holding
+  // an expired lease is not enough — a worker that stalled past its expiry
+  // while another reclaimed the row will fail this check and write nothing,
+  // so it can never overwrite the newer owner's outcome. The lease alone gives
+  // mutual exclusion on *claiming*; this token is what extends that to
+  // *committing*.
+  processingLeaseToken String? @map("processing_lease_token")
+
+  // Recovery ownership, held by whichever sweeper replica won the right to
+  // re-create this row's BullMQ job. Entirely separate from the processing
+  // lease: acquiring it must not touch processingLeaseExpiresAt, so recovery
+  // never extends or resets processing staleness. Held until the worker
+  // successfully claims the row (which clears both) or the lease expires.
+  recoveryLeaseToken     String?   @map("recovery_lease_token")
+  recoveryLeaseExpiresAt DateTime? @map("recovery_lease_expires_at")
+
+  humanDecision HumanDecision @relation(fields: [humanDecisionId], references: [id])
+
+  // Supports the sweeper's eligibility scan (status + lease expiry).
+  @@index([status, processingLeaseExpiresAt])
+  @@map("decision_executions")
 }
 
 model AuditLog {
@@ -234,4 +375,198 @@ model EvaluationResult {
 
   @@index([runId])
   @@map("evaluation_results")
+}
+
+enum PrecedentReasonCode {
+  CONFIRMS_POLICY
+  POLICY_MISAPPLIED
+  MISSING_CONTEXT
+  BUSINESS_EXCEPTION
+  PRECEDENT_CONFLICT
+  OTHER
+
+  @@map("precedent_reason_code")
+}
+
+enum PrecedentStatus {
+  PROPOSED
+  ACTIVE
+  REVOKED
+
+  @@map("precedent_status")
+}
+
+enum RuleSuggestionPatternType {
+  MISSING_POLICY
+  OUTDATED_POLICY
+  RECURRING_EXCEPTION
+  INCONSISTENT_DECISIONS
+  NEW_ROUTING_RULE
+
+  @@map("rule_suggestion_pattern_type")
+}
+
+enum RuleSuggestionStatus {
+  PROPOSED
+  ACCEPTED
+  DISMISSED
+
+  @@map("rule_suggestion_status")
+}
+
+// No PROPOSED state, unlike PrecedentStatus: an OperatingRule does not exist
+// until a governance approver writes one, so the act of creation IS the
+// approval. There is nothing to promote from.
+enum OperatingRuleStatus {
+  ACTIVE
+  REVOKED
+
+  @@map("operating_rule_status")
+}
+
+// One row per HumanDecision, capturing the richer feedback V2 requires beyond
+// outcome/rationale (which stay on HumanDecision — that model is load-bearing
+// for execution safety and stays untouched). `precedentEligible` is the
+// reviewer's *nomination* only; it does not make the case retrievable on its
+// own — see PrecedentRecord.status, which requires a separate governance
+// approval (Phase 3) before ACTIVE.
+model DecisionFeedback {
+  id                String              @id @default(uuid()) @db.Uuid
+  humanDecisionId   String              @unique @map("human_decision_id") @db.Uuid
+  reasonCode        PrecedentReasonCode @map("reason_code")
+  missingContext    String?             @map("missing_context") @db.Text
+  precedentEligible Boolean             @default(false) @map("precedent_eligible")
+  createdAt         DateTime            @default(now()) @map("created_at")
+
+  humanDecision HumanDecision    @relation(fields: [humanDecisionId], references: [id])
+  precedent     PrecedentRecord?
+
+  @@map("decision_feedback")
+}
+
+// A candidate or active piece of retrievable precedent. status starts at
+// PROPOSED (written automatically when DecisionFeedback.precedentEligible is
+// true) and only becomes ACTIVE (and therefore retrievable) through an
+// explicit governance action — see approvedBy/approvedAt, populated by
+// Phase 3's promotion endpoint, never by the original reviewer's own write.
+// embedding/policyVersionSnapshot support Phase 4's retrieval + staleness
+// checks; summary is a deterministic templated string (not LLM-authored),
+// built from the case's structured facts, so the knowledge base stays
+// auditable.
+model PrecedentRecord {
+  id                    String                       @id @default(uuid()) @db.Uuid
+  decisionFeedbackId    String                       @unique @map("decision_feedback_id") @db.Uuid
+  accessRequestId       String                       @map("access_request_id") @db.Uuid
+  targetSystem          String                       @map("target_system")
+  entitlementKey        String                       @map("entitlement_key")
+  department            String?
+  costCenter            String?                      @map("cost_center")
+  summary               String                       @db.Text
+  embedding             Unsupported("vector(1536)")?
+  // Identifies the text representation used to create embedding. Retrieval
+  // accepts only the current version, so vectors made from the former verbose
+  // decision summary cannot be mixed with canonical request-fact vectors.
+  embeddingVersion      Int                          @default(2) @map("embedding_version")
+  policyVersionSnapshot Json                         @map("policy_version_snapshot")
+  status                PrecedentStatus              @default(PROPOSED)
+  approvedBy            String?                      @map("approved_by")
+  approvedAt            DateTime?                    @map("approved_at")
+  revokedReason         String?                      @map("revoked_reason") @db.Text
+  createdAt             DateTime                     @default(now()) @map("created_at")
+
+  decisionFeedback DecisionFeedback    @relation(fields: [decisionFeedbackId], references: [id])
+  accessRequest    AccessRequest       @relation(fields: [accessRequestId], references: [id])
+  citations        PrecedentCitation[]
+
+  // Supports Phase 4's retrieval filter: status = ACTIVE scoped to a system/entitlement.
+  @@index([targetSystem, entitlementKey, status, embeddingVersion])
+  @@map("precedent_records")
+}
+
+// Mirrors AiRecommendationCitation's design exactly: a real FK to the
+// PrecedentRecord it cites, plus a denormalized snapshot of the outcome and
+// summary at citation time, so a historical citation stays meaningful even
+// if the precedent is later revoked or its summary regenerated.
+model PrecedentCitation {
+  id                 String   @id @default(uuid()) @db.Uuid
+  aiRecommendationId String   @map("ai_recommendation_id") @db.Uuid
+  precedentRecordId  String   @map("precedent_record_id") @db.Uuid
+  relevanceReason    String   @map("relevance_reason") @db.Text
+  outcomeSnapshot    String   @map("outcome_snapshot")
+  summarySnapshot    String   @map("summary_snapshot") @db.Text
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  aiRecommendation AiRecommendation @relation(fields: [aiRecommendationId], references: [id])
+  precedentRecord  PrecedentRecord  @relation(fields: [precedentRecordId], references: [id])
+
+  @@index([aiRecommendationId])
+  @@index([precedentRecordId])
+  @@map("precedent_citations")
+}
+
+// A surfaced candidate pattern from Phase 5's aggregation job. Never applied
+// automatically — status only moves PROPOSED -> ACCEPTED/DISMISSED via an
+// explicit reviewedBy action. Deliberately no FK array to HumanDecision;
+// supportingDecisionIds is a plain string array of ids so this table has no
+// hard dependency on how HumanDecision evolves.
+model RuleSuggestion {
+  id                    String                    @id @default(uuid()) @db.Uuid
+  patternType           RuleSuggestionPatternType @map("pattern_type")
+  targetSystem          String                    @map("target_system")
+  entitlementKey        String                    @map("entitlement_key")
+  description           String                    @db.Text
+  supportingDecisionIds String[]                  @map("supporting_decision_ids")
+  status                RuleSuggestionStatus      @default(PROPOSED)
+  reviewedBy            String?                   @map("reviewed_by")
+  reviewedAt            DateTime?                 @map("reviewed_at")
+  reviewNote            String?                   @map("review_note") @db.Text
+  createdAt             DateTime                  @default(now()) @map("created_at")
+
+  operatingRule OperatingRule?
+
+  @@unique([patternType, targetSystem, entitlementKey])
+  @@map("rule_suggestions")
+}
+
+// Governance-approved operating guidance, scoped to one (targetSystem,
+// entitlementKey), written when an approver accepts a RuleSuggestion and
+// supplies guidance text.
+//
+// This exists because accepting a suggestion previously changed nothing that
+// any future request could read: nothing in the retrieval path queried
+// rule_suggestions, so an accepted rule influenced later requests only as a
+// side effect, by promoting precedents that happened to be nominated behind
+// it. That made the "an approved change influences a later request without a
+// code or prompt deployment" outcome true only by proxy. An OperatingRule is
+// the first-class thing retrieval actually reads.
+//
+// `guidance` is human-authored by the approver — never model-generated and
+// never derived from the pattern description — so the knowledge base stays
+// auditable in exactly the way PrecedentRecord.summary does.
+//
+// Deliberately NOT embedded for vector search, unlike PrecedentRecord: a rule
+// is scoped to an exact (system, entitlement) pair, so an equality lookup
+// answers "does this rule apply to this request" completely and
+// deterministically. Semantic similarity would add a ranking question where
+// none exists, and a false-positive path where there is currently none.
+model OperatingRule {
+  id               String              @id @default(uuid()) @db.Uuid
+  ruleSuggestionId String              @unique @map("rule_suggestion_id") @db.Uuid
+  targetSystem     String              @map("target_system")
+  entitlementKey   String              @map("entitlement_key")
+  patternType      RuleSuggestionPatternType @map("pattern_type")
+  guidance         String              @db.Text
+  status           OperatingRuleStatus @default(ACTIVE)
+  approvedBy       String              @map("approved_by")
+  approvedAt       DateTime            @default(now()) @map("approved_at")
+  revokedBy        String?             @map("revoked_by")
+  revokedReason    String?             @map("revoked_reason") @db.Text
+  revokedAt        DateTime?           @map("revoked_at")
+  createdAt        DateTime            @default(now()) @map("created_at")
+
+  ruleSuggestion RuleSuggestion @relation(fields: [ruleSuggestionId], references: [id])
+
+  // Supports the recommendation-time lookup: ACTIVE rules for one scope.
+  @@index([targetSystem, entitlementKey, status])
+  @@map("operating_rules")
 }

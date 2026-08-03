@@ -1,4 +1,8 @@
-import { Tokenizer, chunkMarkdown, parseSections } from './chunking';
+import {
+  Tokenizer,
+  chunkMarkdown,
+  parseSections,
+} from './chunking';
 
 // Reversible word-based tokenizer: one token per whitespace-delimited word.
 // Deterministic and exactly reversible, so window math is verifiable without
@@ -123,5 +127,21 @@ describe('chunkMarkdown', () => {
     expect(() =>
       chunkMarkdown(SAMPLE, tokenizer, { maxTokens: 0, overlapTokens: 0 }),
     ).toThrow();
+  });
+
+  it('preserves source typography in stored chunk content', () => {
+    const markdown =
+      '## 3.1 Standard Read Access\n\n' +
+      'Employees in cost centers—specifically Finance Analytics (`CC-FIN-07`) ' +
+      'and Finance Operations (`CC-FIN-12`)—may request access using “standard” approval.\n';
+    const chunks = chunkMarkdown(markdown, tokenizer, {
+      maxTokens: 500,
+      overlapTokens: 50,
+    });
+
+    expect(chunks[0].content).toContain('cost centers—specifically');
+    expect(chunks[0].content).toContain('`CC-FIN-07`');
+    expect(chunks[0].content).toContain('`CC-FIN-12`');
+    expect(chunks[0].content).toContain('“standard”');
   });
 });

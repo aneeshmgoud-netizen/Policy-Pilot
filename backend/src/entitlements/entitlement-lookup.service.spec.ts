@@ -107,58 +107,99 @@ describe('EntitlementLookupService', () => {
   });
 
   describe.each(SOD_CONFLICT_PAIRS)(
-    '$ruleId ($entitlementKeys.0 <-> $entitlementKeys.1)',
-    ({ systemName, entitlementKeys, ruleId }) => {
-      const [heldKey, requestedKey] = entitlementKeys;
-
-      it(`flags a conflict when the employee holds ${heldKey} and requests ${requestedKey}`, async () => {
-        const prisma = makePrismaMock([row(systemName, heldKey)]);
+    '$ruleId ($a.entitlementKey <-> $b.entitlementKey)',
+    ({ a, b, ruleId }) => {
+      it(`flags a conflict when the employee holds ${a.entitlementKey} and requests ${b.entitlementKey}`, async () => {
+        const prisma = makePrismaMock([row(a.systemName, a.entitlementKey)]);
         const service = new EntitlementLookupService(prisma);
 
         const result = await service.lookup(
           'EMP-90118',
-          systemName,
-          requestedKey,
+          b.systemName,
+          b.entitlementKey,
         );
 
         expect(result.sodConflicts).toEqual([
           {
             ruleId,
-            conflictingEntitlementKey: heldKey,
+            conflictingEntitlementKey: a.entitlementKey,
             description: expect.any(String),
           },
         ]);
       });
 
-      it(`flags a conflict in the reverse direction (holds ${requestedKey}, requests ${heldKey})`, async () => {
-        const prisma = makePrismaMock([row(systemName, requestedKey)]);
+      it(`flags a conflict in the reverse direction (holds ${b.entitlementKey}, requests ${a.entitlementKey})`, async () => {
+        const prisma = makePrismaMock([row(b.systemName, b.entitlementKey)]);
         const service = new EntitlementLookupService(prisma);
 
-        const result = await service.lookup('EMP-90118', systemName, heldKey);
+        const result = await service.lookup(
+          'EMP-90118',
+          a.systemName,
+          a.entitlementKey,
+        );
 
         expect(result.sodConflicts).toEqual([
           {
             ruleId,
-            conflictingEntitlementKey: requestedKey,
+            conflictingEntitlementKey: b.entitlementKey,
             description: expect.any(String),
           },
         ]);
       });
 
-      it(`does not flag a conflict when the employee holds neither ${heldKey} nor ${requestedKey}`, async () => {
+      it(`does not flag a conflict when the employee holds neither ${a.entitlementKey} nor ${b.entitlementKey}`, async () => {
         const prisma = makePrismaMock([]);
         const service = new EntitlementLookupService(prisma);
 
         const result = await service.lookup(
           'EMP-90118',
-          systemName,
-          requestedKey,
+          b.systemName,
+          b.entitlementKey,
         );
 
         expect(result.sodConflicts).toEqual([]);
       });
     },
   );
+
+  it('flags SoD-SEC-02 when the two held/requested entitlements are on different systems', async () => {
+    const prisma = makePrismaMock([
+      row('CLOUD_CONSOLE', 'PROD_SECRETS_ADMIN'),
+    ]);
+    const service = new EntitlementLookupService(prisma);
+
+    const result = await service.lookup(
+      'EMP-11029',
+      'DEPLOY_PIPELINE',
+      'PROD_DEPLOYER',
+    );
+
+    expect(result.sodConflicts).toEqual([
+      {
+        ruleId: 'SoD-SEC-02',
+        conflictingEntitlementKey: 'PROD_SECRETS_ADMIN',
+        description: expect.any(String),
+      },
+    ]);
+  });
+
+  it('does not flag SoD-SEC-02 when PROD_SECRETS_ADMIN is held on the wrong system', async () => {
+    // Same entitlement key on a system the pair doesn't reference must not
+    // cross-trigger — the cross-system pair still requires an exact
+    // (systemName, entitlementKey) match on both sides.
+    const prisma = makePrismaMock([
+      row('SOME_OTHER_SYSTEM', 'PROD_SECRETS_ADMIN'),
+    ]);
+    const service = new EntitlementLookupService(prisma);
+
+    const result = await service.lookup(
+      'EMP-11029',
+      'DEPLOY_PIPELINE',
+      'PROD_DEPLOYER',
+    );
+
+    expect(result.sodConflicts).toEqual([]);
+  });
 
   it('does not flag a conflict for a system the SoD pair does not apply to', async () => {
     // Same entitlement key coincidence across systems must not cross-trigger.

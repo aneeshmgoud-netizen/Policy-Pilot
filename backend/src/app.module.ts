@@ -4,6 +4,7 @@ import { validateEnv } from './config/env.validation';
 import { DecisionsModule } from './decisions/decisions.module';
 import { HealthModule } from './health/health.module';
 import { IngestionModule } from './ingestion/ingestion.module';
+import { PrecedentsModule } from './precedents/precedents.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { QueueModule } from './queue/queue.module';
 import { RagModule } from './rag/rag.module';
@@ -20,6 +21,7 @@ import { RagModule } from './rag/rag.module';
     HealthModule,
     IngestionModule,
     RagModule,
+    PrecedentsModule,
     DecisionsModule,
   ],
 })

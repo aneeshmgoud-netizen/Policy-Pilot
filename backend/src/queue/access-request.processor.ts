@@ -3,15 +3,36 @@ import { Logger } from '@nestjs/common';
 import { AccessRequest, Prisma } from '@prisma/client';
 import { Job } from 'bullmq';
 import { AgentService } from '../agent/agent.service';
-import { PolicyCitation, Recommendation, RecommendationResult } from '../agent/agent.types';
-import { redactPiiInText } from '../common/pii.util';
+import {
+  AgentOperatingRule,
+  Recommendation,
+  RecommendationResult,
+} from '../agent/agent.types';
 import {
   EntitlementLookupResult,
   EntitlementLookupService,
 } from '../entitlements/entitlement-lookup.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { RagService, RetrievedChunk } from '../rag/rag.service';
+import {
+  OperatingRuleRetrievalService,
+  toAgentOperatingRule,
+} from '../precedents/operating-rule-retrieval.service';
+import {
+  PrecedentRetrievalService,
+  toAgentPrecedent,
+} from '../precedents/precedent-retrieval.service';
+import { RagService } from '../rag/rag.service';
+import {
+  codeForStage,
+  PROCESSING_ERROR_CODES,
+  PROCESSING_STAGES,
+  ProcessingErrorCode,
+  processingErrorMessage,
+  ProcessingStage,
+  SanitizedProcessingError,
+} from './processing-error.util';
 import { ACCESS_REQUEST_QUEUE } from './queue.constants';
+import { RecommendationGroundingService } from './recommendation-grounding.service';
 
 export interface AccessRequestJobData {
   accessRequestId: string;
@@ -22,60 +43,13 @@ const ENTITLEMENT_ACTOR = 'system:entitlement-lookup';
 const AGENT_ACTOR = 'system:recommendation-agent';
 const WORKER_ACTOR = 'system:worker';
 const RETRIEVAL_LIMIT = 8;
+const PRECEDENT_RETRIEVAL_LIMIT = 3;
 
-export interface ResolvedCitation {
-  policyChunkId: string;
-  documentName: string;
-  section: string | null;
-  excerpt: string;
-}
-
-/** First dotted section number appearing anywhere in a string ("§3.2 ..." -> "3.2"). */
-function sectionNumberOf(value: string | null | undefined): string | null {
-  if (!value) {
-    return null;
-  }
-  const match = value.match(/\d+(?:\.\d+)*/);
-  return match ? match[0] : null;
-}
-
-/**
- * Map each LLM citation back to a real retrieved chunk (by document + section
- * number, falling back to document) so we persist a FK to policy_chunks. This
- * is the grounding gate: a citation that matches no retrieved chunk is dropped
- * rather than trusted. De-duplicated by chunk id.
- */
-export function resolveCitations(
-  citations: PolicyCitation[],
-  chunks: RetrievedChunk[],
-): ResolvedCitation[] {
-  const resolved: ResolvedCitation[] = [];
-  const seen = new Set<string>();
-
-  for (const citation of citations) {
-    const citeNumber = sectionNumberOf(citation.section);
-    const match =
-      chunks.find(
-        (chunk) =>
-          chunk.documentName === citation.document_name &&
-          sectionNumberOf(chunk.section) === citeNumber,
-      ) ??
-      chunks.find((chunk) => chunk.documentName === citation.document_name);
-
-    if (!match || seen.has(match.id)) {
-      continue;
-    }
-    seen.add(match.id);
-    resolved.push({
-      policyChunkId: match.id,
-      documentName: match.documentName,
-      section: match.section,
-      excerpt: citation.excerpt,
-    });
-  }
-
-  return resolved;
-}
+// Thrown internally when a status-CAS discovers the request became DECIDED
+// out from under an in-flight job (a duplicate/redelivered job racing a
+// human decision). Caught in process() and treated as a safe no-op — never
+// as a processing failure to retry or record.
+class TerminalRequestError extends Error {}
 
 const SOD_CONFLICT_MODEL_NAME = 'system:sod-conflict-rule';
 
@@ -124,8 +98,13 @@ export function buildSodConflictRecommendation(
   const recommendation: Recommendation = {
     decision: 'DENY',
     justification,
-    policy_citations: [],
+    policy_citation_refs: [],
+    precedent_citations: [],
+    precedent_review: [],
+    operating_rule_review: [],
     confidence: 1,
+    conflict_detected: false,
+    conflict_explanation: '',
   };
 
   return {
@@ -161,33 +140,69 @@ export class AccessRequestProcessor extends WorkerHost {
     private readonly prisma: PrismaService,
     private readonly entitlementLookupService: EntitlementLookupService,
     private readonly ragService: RagService,
+    private readonly precedentRetrievalService: PrecedentRetrievalService,
+    private readonly operatingRuleRetrievalService: OperatingRuleRetrievalService,
     private readonly agentService: AgentService,
+    private readonly recommendationGrounding: RecommendationGroundingService,
   ) {
     super();
   }
 
   async process(job: Job<AccessRequestJobData>): Promise<void> {
+    // Tracked so a failure can be attributed to a stage from a fixed set —
+    // safe structured context, unlike anything read off the exception.
+    let stage: ProcessingStage = PROCESSING_STAGES.LOAD_ENTITLEMENTS;
     try {
-      const { accessRequest, snapshot } = await this.loadEntitlements(job);
-      await this.generateRecommendation(accessRequest, snapshot);
+      const loaded = await this.loadEntitlements(job);
+      if (loaded === null) {
+        return;
+      }
+      stage = PROCESSING_STAGES.GENERATE_RECOMMENDATION;
+      await this.generateRecommendation(loaded.accessRequest, loaded.snapshot);
     } catch (error) {
+      if (error instanceof TerminalRequestError) {
+        // A human decision won the race after this job had already started.
+        // Not a failure: nothing about this job's work should be recorded,
+        // retried, or allowed to move the request off DECIDED. This message is
+        // ours, built from ids — not exception-derived text.
+        this.logger.log(error.message);
+        return;
+      }
       // Record why processing failed before re-throwing. Re-throwing keeps
       // BullMQ's retry/backoff in control; recordFailure only transitions the
       // request to FAILED once retries are exhausted, so a later successful
       // retry can still advance the request.
-      await this.recordFailure(job, error);
-      throw error;
+      //
+      // The original exception is deliberately NOT rethrown: BullMQ persists a
+      // thrown error's message and stack verbatim in Redis. Only the stable
+      // stage code crosses that boundary.
+      const code = codeForStage(stage);
+      await this.recordFailure(job, code, stage);
+      throw new SanitizedProcessingError(code);
     }
   }
 
   private async loadEntitlements(
     job: Job<AccessRequestJobData>,
-  ): Promise<{ accessRequest: AccessRequest; snapshot: EntitlementLookupResult }> {
+  ): Promise<{ accessRequest: AccessRequest; snapshot: EntitlementLookupResult } | null> {
     const { accessRequestId, requestId } = job.data;
 
     const accessRequest = await this.prisma.accessRequest.findUniqueOrThrow({
       where: { id: accessRequestId },
     });
+
+    // DECIDED is terminal. A human can only ever decide a RECOMMENDED
+    // request (see DecisionsService), so this can only be hit by a
+    // duplicate/redelivered job reprocessing a request that's already been
+    // through the full pipeline once — never skip the entitlement lookup or
+    // touch the row for a request that's still legitimately in flight.
+    if (accessRequest.status === 'DECIDED') {
+      this.logger.log(
+        `Skipping access request ${requestId} (accessRequestId=${accessRequestId}): ` +
+          `already DECIDED by a human reviewer; a redelivered/duplicate job must not reopen it.`,
+      );
+      return null;
+    }
 
     const snapshot = await this.entitlementLookupService.lookup(
       accessRequest.employeeId,
@@ -208,15 +223,20 @@ export class AccessRequestProcessor extends WorkerHost {
       sodConflicts: snapshot.sodConflicts,
     } as unknown as Prisma.InputJsonValue;
 
-    await this.prisma.$transaction([
-      this.prisma.accessRequest.update({
-        where: { id: accessRequestId },
+    const advanced = await this.prisma.$transaction(async (tx) => {
+      // Conditional: a human decision could have landed while the lookup
+      // above was in flight. Never overwrite DECIDED, even with a snapshot.
+      const transitioned = await tx.accessRequest.updateMany({
+        where: { id: accessRequestId, status: { not: 'DECIDED' } },
         data: {
           entitlementSnapshot: snapshotForStorage,
           status: 'ENTITLEMENTS_LOADED',
         },
-      }),
-      this.prisma.auditLog.create({
+      });
+      if (transitioned.count === 0) {
+        return false;
+      }
+      await tx.auditLog.create({
         data: {
           accessRequestId,
           eventType: 'ENTITLEMENTS_LOADED',
@@ -228,8 +248,17 @@ export class AccessRequestProcessor extends WorkerHost {
             sodConflictRuleIds: snapshot.sodConflicts.map((c) => c.ruleId),
           },
         },
-      }),
-    ]);
+      });
+      return true;
+    });
+
+    if (!advanced) {
+      this.logger.log(
+        `Skipping access request ${requestId} (accessRequestId=${accessRequestId}): ` +
+          `became DECIDED during entitlement lookup; discarding this snapshot.`,
+      );
+      return null;
+    }
 
     this.logger.log(
       `Loaded entitlements for access request ${requestId} (accessRequestId=${accessRequestId}): ` +
@@ -255,16 +284,58 @@ export class AccessRequestProcessor extends WorkerHost {
   ): Promise<void> {
     const shortCircuited = buildSodConflictRecommendation(snapshot);
 
-    let chunks: RetrievedChunk[] = [];
+    // The rules that were IN FORCE and shown to the model for this request.
+    // Named "retrieved", not "applied", on purpose: this records what the
+    // model was given, which is a fact this code knows. Whether the model
+    // then judged a rule applicable is its own operating_rule_review answer,
+    // verified by the grounding gate. The SoD short-circuit never consults
+    // rules (it never reaches the LLM), so it correctly leaves this empty.
+    let retrievedOperatingRuleIds: string[] = [];
+    let agentOperatingRules: AgentOperatingRule[] = [];
     let result: RecommendationResult;
+    let groundingOutcome: Awaited<
+      ReturnType<RecommendationGroundingService['groundSodDenial']>
+    >;
 
     if (shortCircuited) {
       result = shortCircuited;
-    } else {
-      chunks = await this.ragService.retrieveRelevantChunks(
-        this.buildRetrievalQuery(accessRequest),
-        { limit: RETRIEVAL_LIMIT },
+      // The deterministic path never asks the LLM for citations (see
+      // buildSodConflictRecommendation) — it does its own targeted retrieval
+      // to find the specific policy section backing the triggered rule(s)
+      // before letting the DENY stand.
+      groundingOutcome = await this.recommendationGrounding.groundSodDenial(
+        shortCircuited,
+        snapshot.sodConflicts,
       );
+    } else {
+      const retrievalQuery = this.buildRetrievalQuery(accessRequest);
+      // Operating rules are looked up by exact scope, not by similarity, so
+      // this needs no query text — see OperatingRuleRetrievalService.
+      const [chunks, precedents, operatingRules] = await Promise.all([
+        this.ragService.retrieveRelevantChunks(retrievalQuery, {
+          limit: RETRIEVAL_LIMIT,
+        }),
+        this.precedentRetrievalService.retrieveRelevantPrecedents(
+          {
+            requestType: accessRequest.requestType,
+            targetSystem: accessRequest.targetSystem,
+            entitlementKey: accessRequest.entitlementKey,
+            requesterTitle: accessRequest.requesterTitle,
+            requesterDepartment: accessRequest.requesterDepartment,
+            requesterCostCenter: accessRequest.requesterCostCenter,
+            justification: accessRequest.justification,
+          },
+          {
+            limit: PRECEDENT_RETRIEVAL_LIMIT,
+          },
+        ),
+        this.operatingRuleRetrievalService.retrieveApplicableRules(
+          accessRequest.targetSystem,
+          accessRequest.entitlementKey,
+        ),
+      ]);
+      retrievedOperatingRuleIds = operatingRules.map((rule) => rule.id);
+      agentOperatingRules = operatingRules.map(toAgentOperatingRule);
 
       result = await this.agentService.recommend({
         accessRequest: {
@@ -285,14 +356,60 @@ export class AccessRequestProcessor extends WorkerHost {
           sodConflicts: snapshot.sodConflicts,
         },
         retrievedChunks: chunks,
+        retrievedPrecedents: precedents.map(toAgentPrecedent),
+        operatingRules: agentOperatingRules,
       });
+
+      // Grounding gate: an APPROVE/DENY with no fully-validated source selection
+      // never reaches persistence as-is — it's downgraded to ESCALATE here,
+      // before the transaction even starts. See RecommendationGroundingService
+      // for the fail-closed source-id policy.
+      // The rules are handed to the gate as well as to the model, so an
+      // ignored rule is caught deterministically rather than trusted.
+      groundingOutcome = this.recommendationGrounding.groundLlmRecommendation(
+        result,
+        chunks,
+        precedents,
+        agentOperatingRules,
+      );
     }
 
-    const recommendation = result.recommendation;
-    const citations = resolveCitations(recommendation.policy_citations, chunks);
+    const {
+      recommendation,
+      citations,
+      precedentCitations,
+      decisionSource,
+      audit,
+      rawResponse,
+    } = groundingOutcome;
     const accessRequestId = accessRequest.id;
+    // What the LLM proposed before grounding could rewrite it. The SoD path
+    // never invokes a model, so its deterministic DENY must not be written to
+    // modelDecision/modelConfidence or later counted as reviewer agreement
+    // with AI.
+    const proposed = result.recommendation;
+    const modelWasInvoked = result.modelName !== SOD_CONFLICT_MODEL_NAME;
+    const modelDecision = modelWasInvoked ? proposed.decision : null;
+    const modelConfidence = modelWasInvoked ? proposed.confidence : null;
 
     await this.prisma.$transaction(async (tx) => {
+      // Claim eligibility BEFORE persisting anything else. If a human
+      // decision won the race (this request is already DECIDED), abort the
+      // whole transaction here: no AiRecommendation row, no citations, no
+      // AI_RECOMMENDED audit entry, no status change. Prisma rolls back
+      // everything in this callback when it throws.
+      const transitioned = await tx.accessRequest.updateMany({
+        where: { id: accessRequestId, status: { not: 'DECIDED' } },
+        data: { status: 'RECOMMENDED' },
+      });
+      if (transitioned.count === 0) {
+        throw new TerminalRequestError(
+          `Discarding recommendation for access request ${accessRequest.requestId} ` +
+            `(accessRequestId=${accessRequestId}): a human decision won the race; ` +
+            `the request is already DECIDED.`,
+        );
+      }
+
       const created = await tx.aiRecommendation.create({
         data: {
           accessRequestId,
@@ -301,8 +418,12 @@ export class AccessRequestProcessor extends WorkerHost {
           confidence: recommendation.confidence,
           modelName: result.modelName,
           promptVersion: result.promptVersion,
-          rawResponse: result.rawResponse as Prisma.InputJsonValue,
+          rawResponse: rawResponse as Prisma.InputJsonValue,
           attemptNumber: result.attemptNumber,
+          modelDecision,
+          modelConfidence,
+          decisionSource,
+          retrievedOperatingRuleIds,
         },
       });
 
@@ -318,10 +439,17 @@ export class AccessRequestProcessor extends WorkerHost {
         });
       }
 
-      await tx.accessRequest.update({
-        where: { id: accessRequestId },
-        data: { status: 'RECOMMENDED' },
-      });
+      if (precedentCitations.length > 0) {
+        await tx.precedentCitation.createMany({
+          data: precedentCitations.map((citation) => ({
+            aiRecommendationId: created.id,
+            precedentRecordId: citation.precedentRecordId,
+            relevanceReason: citation.relevanceReason,
+            outcomeSnapshot: citation.outcomeSnapshot,
+            summarySnapshot: citation.summarySnapshot,
+          })),
+        });
+      }
 
       await tx.auditLog.create({
         data: {
@@ -335,6 +463,9 @@ export class AccessRequestProcessor extends WorkerHost {
             promptVersion: result.promptVersion,
             attemptNumber: result.attemptNumber,
             citationCount: citations.length,
+            decisionSource,
+            modelDecision,
+            retrievedOperatingRuleCount: retrievedOperatingRuleIds.length,
             tokenUsage: {
               promptTokens: result.usage.promptTokens,
               completionTokens: result.usage.completionTokens,
@@ -342,6 +473,9 @@ export class AccessRequestProcessor extends WorkerHost {
             },
             estimatedCostUsd: result.usage.estimatedCostUsd,
             latencyMs: result.usage.latencyMs,
+            // Auditability for the grounding gate: counts and stable reason
+            // codes only — never raw excerpt/chunk text (see GroundingAudit).
+            grounding: audit as unknown as Prisma.InputJsonValue,
           },
         },
       });
@@ -350,37 +484,31 @@ export class AccessRequestProcessor extends WorkerHost {
     this.logger.log(
       `Recommendation for ${accessRequest.requestId}: ${recommendation.decision} ` +
         `(confidence ${recommendation.confidence}, ${citations.length} citation(s), ` +
-        `attempt ${result.attemptNumber}, $${result.usage.estimatedCostUsd.toFixed(6)})`,
+        `attempt ${result.attemptNumber}, $${result.usage.estimatedCostUsd.toFixed(6)})` +
+        (audit.convertedToEscalate ? ' [downgraded to ESCALATE: ungrounded evidence]' : ''),
     );
   }
 
   private async recordFailure(
     job: Job<AccessRequestJobData>,
-    error: unknown,
+    code: ProcessingErrorCode,
+    stage: ProcessingStage,
   ): Promise<void> {
     const { accessRequestId, requestId } = job.data;
     const attempt = (job.attemptsMade ?? 0) + 1;
     const maxAttempts = job.opts?.attempts ?? 1;
     const isFinalAttempt = attempt >= maxAttempts;
-    const rawMessage = error instanceof Error ? error.message : String(error);
-    // Masked before reaching either the log line or the audit payload below:
-    // an error thrown from deeper in the stack (Prisma, upstream API, etc.)
-    // is not guaranteed to be free of EMP-/CC- values. redactPiiInText only
-    // replaces substrings that match those id patterns — it does not touch
-    // surrounding text, so this is safe to apply to a full stack trace
-    // without destroying its file paths/line numbers/structure.
-    const message = redactPiiInText(rawMessage);
-    // Captured in addition to the message (previously stack traces weren't
-    // recorded anywhere for this failure path) so engineers retain real
-    // debugging context — which file/line/call chain failed — for
-    // production timeouts or downstream errors, not just a one-line summary.
-    const stack =
-      error instanceof Error && error.stack ? redactPiiInText(error.stack) : null;
 
+    // Content-free: the thrown value is never passed to this method, so there
+    // is nothing exception-derived in scope to log or persist. What remains is
+    // the stable code, the fixed message for it, and safe structured context
+    // (request id, stage, attempt counters). See processing-error.util.ts for
+    // why the previous redacted message + stack capture was insufficient.
     this.logger.error(
       `Processing failed for access request ${requestId} ` +
-        `(accessRequestId=${accessRequestId}), attempt ${attempt}/${maxAttempts}: ${message}`,
-      stack ?? undefined,
+        `(accessRequestId=${accessRequestId}), stage ${stage}, ` +
+        `attempt ${attempt}/${maxAttempts}: ${code} — ` +
+        `${processingErrorMessage(code)}`,
     );
 
     try {
@@ -393,8 +521,8 @@ export class AccessRequestProcessor extends WorkerHost {
             attempt,
             maxAttempts,
             finalAttempt: isFinalAttempt,
-            error: message,
-            errorStack: stack,
+            stage,
+            errorCode: code,
           },
         },
       });
@@ -402,10 +530,13 @@ export class AccessRequestProcessor extends WorkerHost {
       if (isFinalAttempt) {
         // Retries exhausted: transition to the terminal FAILED state and log
         // the failure in one transaction so the state change and its
-        // explanation commit together (or not at all).
+        // explanation commit together (or not at all). Conditional so a
+        // request a human already decided (DECIDED) is never overwritten —
+        // this failure record still gets written either way, it just
+        // doesn't affect status if that guard doesn't match.
         await this.prisma.$transaction([
-          this.prisma.accessRequest.update({
-            where: { id: accessRequestId },
+          this.prisma.accessRequest.updateMany({
+            where: { id: accessRequestId, status: { not: 'DECIDED' } },
             data: { status: 'FAILED' },
           }),
           auditOp,
@@ -414,15 +545,14 @@ export class AccessRequestProcessor extends WorkerHost {
         // Retries remain: record the attempt but leave the request as-is.
         await auditOp;
       }
-    } catch (recordError) {
-      // Never let failure bookkeeping mask the original error or crash the
-      // worker — the original error is still thrown by the caller and drives
-      // BullMQ's retry/backoff.
+    } catch {
+      // Never let failure bookkeeping mask the original failure or crash the
+      // worker — the caller still throws (a sanitized error), which drives
+      // BullMQ's retry/backoff. The caught value is not inspected.
       this.logger.error(
         `Failed to record processing failure for accessRequestId=${accessRequestId}: ` +
-          (recordError instanceof Error
-            ? recordError.message
-            : String(recordError)),
+          `${PROCESSING_ERROR_CODES.FAILURE_BOOKKEEPING_FAILED} — ` +
+          `${processingErrorMessage(PROCESSING_ERROR_CODES.FAILURE_BOOKKEEPING_FAILED)}`,
       );
     }
   }

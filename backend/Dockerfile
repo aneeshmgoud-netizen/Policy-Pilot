@@ -6,7 +6,9 @@
 # root npm-workspaces lockfile into the image.
 
 # ---- builder --------------------------------------------------------------
-FROM node:20-alpine AS builder
+# Kept in lockstep with the Node version pinned in CI (.github/workflows/ci.yml)
+# and used locally, so a passing build here means the same runtime everywhere.
+FROM node:24-alpine AS builder
 WORKDIR /app
 
 # Prisma shells out to `openssl` to detect which libssl the query engine
@@ -26,7 +28,7 @@ RUN npx prisma generate
 RUN npm run build
 
 # ---- production -------------------------------------------------------
-FROM node:20-alpine AS production
+FROM node:24-alpine AS production
 ENV NODE_ENV=production
 WORKDIR /app
 

@@ -48,4 +48,9 @@ describe('DashboardAuthGuard', () => {
     const { context } = mockContext('Bearer mock-token-viewer');
     expect(() => guard.canActivate(context)).toThrow(ForbiddenException);
   });
+
+  it('rejects a GOVERNANCE_APPROVER token at the reviewer boundary', () => {
+    const { context } = mockContext('Bearer mock-token-governance');
+    expect(() => guard.canActivate(context)).toThrow(ForbiddenException);
+  });
 });

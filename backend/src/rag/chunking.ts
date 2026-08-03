@@ -99,7 +99,6 @@ export function chunkMarkdown(
   const step = maxTokens - overlapTokens;
   const chunks: RawChunk[] = [];
   let chunkIndex = 0;
-
   for (const section of parseSections(markdown)) {
     const tokens = tokenizer.encode(section.body);
 

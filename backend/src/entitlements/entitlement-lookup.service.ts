@@ -49,29 +49,39 @@ export class EntitlementLookupService {
         row.systemName === targetSystem && row.entitlementKey === entitlementKey,
     );
 
-    const sodConflicts: SodConflictFinding[] = SOD_CONFLICT_PAIRS.filter(
-      (pair) =>
-        pair.systemName === targetSystem &&
-        pair.entitlementKeys.includes(entitlementKey),
-    )
-      .map((pair) => {
-        const conflictingKey = pair.entitlementKeys.find(
-          (key) => key !== entitlementKey,
-        )!;
-        const holdsConflictingKey = activeRows.some(
+    const sodConflicts: SodConflictFinding[] = SOD_CONFLICT_PAIRS.map(
+      (pair) => {
+        // Each pair has two independent (system, entitlement) sides so a
+        // rule can span two different systems (e.g. SoD-SEC-02), not just
+        // two entitlements within one system. Figure out which side (if
+        // either) the requested entitlement matches, then check whether the
+        // *other* side is currently held anywhere in the employee's active
+        // rows — not scoped to targetSystem, since the other side may be on
+        // a different system entirely.
+        const matchesA =
+          pair.a.systemName === targetSystem &&
+          pair.a.entitlementKey === entitlementKey;
+        const matchesB =
+          pair.b.systemName === targetSystem &&
+          pair.b.entitlementKey === entitlementKey;
+        if (!matchesA && !matchesB) {
+          return null;
+        }
+        const other = matchesA ? pair.b : pair.a;
+        const holdsOther = activeRows.some(
           (row) =>
-            row.systemName === targetSystem &&
-            row.entitlementKey === conflictingKey,
+            row.systemName === other.systemName &&
+            row.entitlementKey === other.entitlementKey,
         );
-        return holdsConflictingKey
+        return holdsOther
           ? {
               ruleId: pair.ruleId,
-              conflictingEntitlementKey: conflictingKey,
+              conflictingEntitlementKey: other.entitlementKey,
               description: pair.description,
             }
           : null;
-      })
-      .filter((finding): finding is SodConflictFinding => finding !== null);
+      },
+    ).filter((finding): finding is SodConflictFinding => finding !== null);
 
     return {
       currentActiveEntitlements,

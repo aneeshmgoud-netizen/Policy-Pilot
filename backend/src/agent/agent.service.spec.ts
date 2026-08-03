@@ -10,14 +10,11 @@ import { RecommendationInput } from './agent.types';
 const VALID_RECOMMENDATION = {
   decision: 'APPROVE',
   justification: 'Permitted for CC-FIN-07 members per §3.1 standard read access.',
-  policy_citations: [
-    {
-      document_name: 'POL-DATA-001',
-      section: '3.1',
-      excerpt: 'members of `CC-FIN-07` or `CC-FIN-12` may request baseline read access',
-    },
-  ],
+  policy_citation_refs: [{ source_id: 'POLICY_SOURCE_001' }],
+  precedent_citations: [],
   confidence: 0.82,
+  conflict_detected: false,
+  conflict_explanation: '',
 };
 
 const INPUT: RecommendationInput = {
@@ -38,11 +35,13 @@ const INPUT: RecommendationInput = {
   },
   retrievedChunks: [
     {
+      id: 'chunk-1',
       documentName: 'POL-DATA-001',
       section: '3.1 Standard Read Access Protocol',
       content: 'members of `CC-FIN-07` or `CC-FIN-12` may request baseline read access ...',
     },
   ],
+  retrievedPrecedents: [],
 };
 
 function response(
@@ -93,10 +92,10 @@ describe('AgentService', () => {
 
     expect(result.recommendation.decision).toBe('APPROVE');
     expect(result.recommendation.confidence).toBe(0.82);
-    expect(result.recommendation.policy_citations).toHaveLength(1);
+    expect(result.recommendation.policy_citation_refs).toHaveLength(1);
     expect(result.attemptNumber).toBe(1);
     expect(result.modelName).toBe('gpt-4o-mini');
-    expect(result.promptVersion).toBe('v3');
+    expect(result.promptVersion).toBe('v6');
     expect(create).toHaveBeenCalledTimes(1);
     // JSON mode is requested.
     expect(create.mock.calls[0][0].response_format).toEqual({ type: 'json_object' });
@@ -155,7 +154,7 @@ describe('AgentService', () => {
     const invalid = {
       decision: 'MAYBE', // not in the enum
       justification: '',
-      policy_citations: [],
+      policy_citation_refs: [],
       confidence: 5, // out of [0,1]
     };
     const { client, create } = makeClient([
@@ -191,7 +190,7 @@ describe('AgentService', () => {
       decision: 'ESCALATE',
       justification:
         'Contractor sponsorship under POL-GOV-000 Appendix D cannot be confirmed from the excerpts.',
-      policy_citations: [],
+      policy_citation_refs: [],
       confidence: 0.4,
     };
     const { client } = makeClient([response(escalate)]);
@@ -200,6 +199,48 @@ describe('AgentService', () => {
     const result = await service.recommend(INPUT);
 
     expect(result.recommendation.decision).toBe('ESCALATE');
-    expect(result.recommendation.policy_citations).toEqual([]);
+    expect(result.recommendation.policy_citation_refs).toEqual([]);
+  });
+
+  it('defaults omitted precedent and conflict fields without retrying', async () => {
+    const legacyShape = {
+      decision: 'ESCALATE',
+      justification: 'The policy evidence is incomplete.',
+      policy_citation_refs: [],
+      confidence: 0.4,
+    };
+    const { client, create } = makeClient([response(legacyShape)]);
+    const service = new AgentService({ model: 'gpt-4o-mini' }, client);
+
+    const result = await service.recommend(INPUT);
+
+    expect(result.recommendation.precedent_citations).toEqual([]);
+    expect(result.recommendation.precedent_review).toEqual([]);
+    expect(result.recommendation.conflict_detected).toBe(false);
+    expect(result.recommendation.conflict_explanation).toBe('');
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('includes retrieved precedent as supporting context in the v6 user message', async () => {
+    const { client, create } = makeClient([response(VALID_RECOMMENDATION)]);
+    const service = new AgentService({ model: 'gpt-4o-mini' }, client);
+    await service.recommend({
+      ...INPUT,
+      retrievedPrecedents: [
+        {
+          id: 'precedent-1',
+          summary: 'A comparable finance request was granted.',
+          outcome: 'GRANT',
+          targetSystem: 'DATA_WAREHOUSE',
+          entitlementKey: 'FIN_DATASET_READ',
+          similarity: 0.91,
+        },
+      ],
+    });
+
+    const userMessage = create.mock.calls[0][0].messages[1].content as string;
+    expect(userMessage).toContain('=== PRECEDENT EXCERPTS');
+    expect(userMessage).toContain('id: precedent-1');
+    expect(userMessage).toContain('outcome: GRANT');
   });
 });

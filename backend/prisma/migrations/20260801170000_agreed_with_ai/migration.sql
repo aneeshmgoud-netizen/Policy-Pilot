@@ -1,0 +1,15 @@
+-- Separate "did the reviewer agree with the AI" from "did the reviewer deviate
+-- from the recommendation they were shown".
+--
+-- overrides_recommendation compares the human outcome against the EFFECTIVE
+-- post-grounding decision, which is correct for its job: it drives the
+-- mandatory rationale. But it was also being read as the V2 "reviewer agreed
+-- with the AI" field, and those differ whenever the grounding gate overrode the
+-- model. A model APPROVE turned into ESCALATE, then granted by a human, was
+-- recorded as an override of an AI that had in fact recommended exactly that —
+-- inflating the override rate and putting a false sentence into every
+-- precedent summary built from the decision.
+--
+-- Nullable with no backfill: existing rows have no recorded model proposal to
+-- compare against, and inferring one now would be a guess.
+ALTER TABLE "human_decisions" ADD COLUMN "agreed_with_ai" BOOLEAN;
