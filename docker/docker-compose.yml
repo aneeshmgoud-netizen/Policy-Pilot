@@ -28,6 +28,24 @@ services:
       timeout: 5s
       retries: 10
 
+  # One-shot migration runner. Built from the `builder` stage (which still has
+  # the `prisma` CLI devDependency and the full `prisma/` directory, unlike the
+  # slimmed-down `production` stage the api service runs) so it needs no
+  # separate image. `api` waits on this container *exiting 0*, not just
+  # starting, so the schema is guaranteed to exist before the API accepts
+  # traffic on a fresh clone — no manual migrate step required.
+  migrate:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: builder
+    environment:
+      DATABASE_URL: postgresql://policy_pilot:policy_pilot@postgres:5432/policy_pilot?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["npx", "prisma", "migrate", "deploy"]
+
   api:
     build:
       context: ../backend
@@ -53,6 +71,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   web:
     build:
