@@ -1,114 +1,126 @@
 # Policy Pilot
 
-AI-assisted, human-in-the-loop access-review system, built for the *Full-Stack
-AI Engineer Assignment*.
+Policy Pilot is an AI-assisted, human-in-the-loop access-review system built for the Full-Stack AI Engineer Assignment.
 
-**AI-assisted development disclosure**: built with Claude Code (Anthropic) as
-a pair-programming assistant throughout; all decisions and verification were
-directed by the author.
+It combines policy retrieval, historical precedent, deterministic safety checks, and human governance. The AI recommends `APPROVE`, `DENY`, or `ESCALATE`; an authorized reviewer always makes the final `GRANT` or `DENY` decision. Reviewed cases can become governed precedent, and approved operating rules can influence future recommendations without a model retrain or application deployment.
+
+## Repository layout
+
+```text
+backend/    NestJS API, BullMQ worker, Prisma, RAG, governance, and evaluation
+frontend/   React, Vite, and TanStack Query review dashboard
+docker/     PostgreSQL/pgvector, Redis, API, and web containers
+policies/   Sample enterprise policy documents
+docs/       Architecture, V2 technical summary, and evaluation notes
+```
 
 ## Documentation
 
-- [`docs/architecture-blueprint.md`](docs/architecture-blueprint.md) — system architecture diagram
-- [`docs/technical-implementation-brief.pdf`](docs/technical-implementation-brief.pdf) — 2-page technical brief
-
-
-
-## Repo layout
-
-```
-backend/    NestJS API + BullMQ worker (Prisma, RAG, agent, eval)
-frontend/   React + Vite + TanStack Query dashboard
-docker/     docker-compose.yml (Postgres/pgvector, Redis, api, web)
-policies/   Sample policy documents ingested by the RAG pipeline
-docs/       Architecture blueprint, technical brief, chunking strategy
-```
+- [Architecture blueprint](docs/architecture-blueprint.md)
+- [V2 technical design summary](docs/Technical%20Summary%20-%20V2%20Implementation%20.pdf)
+- [Evaluation report](docs/evaluation-report.md)
+- [RAG chunking strategy](docs/CHUNKING_STRATEGY.md)
 
 ## Prerequisites
 
-- Node.js 20+, Docker Desktop
+- Node.js 24
+- Docker Desktop
 - An OpenAI API key
 
-## Setup
+## Local setup
 
-1. Copy env files and generate an `INGESTION_API_KEY`; set `OPENAI_API_KEY`
-   in `backend/.env` (required for RAG embeddings and the recommendation
-   agent):
-   ```bash
-   cp backend/.env.example backend/.env
-   cp frontend/.env.example frontend/.env
+Run all commands from the repository root.
+
+1. Create the local environment files:
+
+   ```powershell
+   Copy-Item backend/.env.example backend/.env
+   Copy-Item frontend/.env.example frontend/.env
    node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
    ```
-2. Install dependencies (npm workspaces, from repo root):
-   ```bash
+
+   Add the generated value as `INGESTION_API_KEY` in `backend/.env`, then add your `OPENAI_API_KEY`.
+
+2. Install dependencies:
+
+   ```powershell
    npm install
    ```
-3. Start Postgres (pgvector) + Redis only:
-   ```bash
+
+3. Start PostgreSQL and Redis:
+
+   ```powershell
    docker compose -f docker/docker-compose.yml up -d postgres redis
    ```
-4. Generate the Prisma client and apply migrations:
-   ```bash
+
+4. Prepare the database and policy corpus:
+
+   ```powershell
    npm run prisma:generate --workspace backend
    npm run prisma:migrate --workspace backend
-   ```
-   > Do **not** run `prisma migrate dev` on this project — it will drop the
-   > pgvector HNSW index (Prisma can't represent it, so it treats the index
-   > as drift). Always use `prisma:migrate` (`migrate deploy`).
-5. Seed sample entitlement data (safe to re-run):
-   ```bash
    npm run db:seed
-   ```
-6. Ingest the sample policy documents into pgvector (safe to re-run; calls
-   the OpenAI embeddings API):
-   ```bash
    npm run rag:ingest --workspace backend
    ```
-7. Run the backend and frontend (separate terminals):
-   ```bash
+
+   Use `prisma:migrate`, not `prisma migrate dev`; Prisma cannot represent the pgvector HNSW index and may treat it as schema drift.
+
+5. Start the application in two terminals:
+
+   ```powershell
    npm run dev:backend
+   ```
+
+   ```powershell
    npm run dev:frontend
    ```
-8. Open http://localhost:5173 and log in as `Alice Chen` or `Bob Nakamura`
-   (mocked reviewer identities — see `frontend/src/lib/mock-users.ts`).
-   Backend health check: http://localhost:3000/health
 
-### Running the full stack in Docker instead
+6. Open [http://localhost:5173](http://localhost:5173). The development identity switcher provides:
 
-```bash
+   - Alice Chen or Bob Nakamura for request review
+   - Priya Anand for precedent and operating-rule governance
+   - Dana Ortiz for view-only access
+
+   Backend health check: [http://localhost:3000/health](http://localhost:3000/health)
+
+## Docker setup
+
+To run the full stack without hot reload:
+
+```powershell
 npm run docker:up
 ```
-Brings up all four services (Postgres, Redis, API, web) in one shot — API on
-http://localhost:3000, web UI on http://localhost:8080. No hot-reload; use
-the steps above for active development.
+
+Open the web UI at [http://localhost:8080](http://localhost:8080). The API is available at [http://localhost:3000](http://localhost:3000).
+
+Stop the stack with:
+
+```powershell
+npm run docker:down
+```
 
 ## Demo
 
-Submit a representative set of access requests through the real ingestion
-webhook (10 requests across all 6 entitlement systems, covering every
-decision path, plus one intentionally malformed request):
-```bash
+After seeding the database and ingesting the policies, submit the 28 sample access requests through the real ingestion endpoint:
+
+```powershell
 npm run demo:requests --workspace backend
 ```
-Then open the dashboard and refresh the request list to watch recommendations
-appear as the worker processes each one. See
-[`backend/demo-requests.json`](backend/demo-requests.json) for the exact
-payloads and expected outcomes.
 
-To clear submitted requests between demo runs (keeps seeded entitlements and
-the ingested policy corpus intact):
-```bash
-docker compose -f docker/docker-compose.yml exec postgres psql -U policy_pilot -d policy_pilot -c "TRUNCATE TABLE access_requests CASCADE;"
+Open the dashboard and refresh the request list while the worker generates recommendations. The payloads and expected outcomes are defined in [backend/demo-requests.json](backend/demo-requests.json).
+
+To submit a custom request, send a `POST` request to `http://localhost:3000/api/v1/access-requests` with an `X-API-Key` matching `INGESTION_API_KEY`. The request body is defined by [create-access-request.dto.ts](backend/src/ingestion/dto/create-access-request.dto.ts).
+
+## Quality checks
+
+```powershell
+npm test
+npm run type-check
+npm run lint
+npm run build
 ```
 
-To submit a single custom request, `POST` to
-`http://localhost:3000/api/v1/access-requests` with an `X-API-Key` header
-matching `INGESTION_API_KEY` and a body matching
-[`create-access-request.dto.ts`](backend/src/ingestion/dto/create-access-request.dto.ts).
+Run the live golden-dataset evaluation separately because it calls the OpenAI API and uses API credit:
 
-## Evaluation and tests
-
-```bash
-npm run eval --workspace backend   # golden-dataset evaluation (spends OpenAI credit)
-npm test                           # backend test suite
+```powershell
+npm run eval --workspace backend
 ```
